@@ -1,0 +1,21 @@
+name: bo_env
+channels:
+  - conda-forge
+
+dependencies:
+  # Core runtime
+  - python=3.11
+  - numpy=1.26
+  - pandas
+  - scipy
+  # Machine learning and optimization
+  - scikit-learn
+  - xgboost  
+  - optuna
+  - shap
+  # Plotting and Excel
+  - matplotlib
+  - openpyxl
+  - xlsxwriter
+  # Notebook support
+  - ipykernel

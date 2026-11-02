@@ -53,10 +53,7 @@ from bo_regression_functions import (
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Run the same non-interactive workflow as bo_regression.ipynb.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
+    parser = argparse.ArgumentParser( description="Run the same non-interactive workflow as bo_regression.ipynb.", formatter_class=argparse.ArgumentDefaultsHelpFormatter, )
     parser.add_argument("--excel-file", required=True)
     parser.add_argument("--sheet-name", default="training")
     parser.add_argument("--target-column", required=True)
@@ -70,6 +67,10 @@ def parse_args():
     parser.add_argument("--inner-cv-splits", type=int, default=3)
     parser.add_argument("--inner-cv-repeats", type=int, default=3)
     parser.add_argument("--n-trials", type=int, default=10)
+    parser.add_argument("--n-jobs", type=int, default=1, help="Parallel outer-fold workers; use 1 for serial execution.")
+    parser.add_argument("--rfe-step", type=float, default=1.0, help="RFE step: integer-like 1 removes one feature; fractions such as 0.1 remove 10%% per step.")
+    parser.add_argument("--one-se", action="store_true", help="Use the one-standard-error rule to prefer fewer descriptors with comparable inner-CV score.")
+    parser.add_argument("--round-digits", type=int, choices=[10, 15], default=15, help="Round numeric input data to a fixed precision for reproducibility.")
     parser.add_argument(
         "--outer-split-strategy",
         choices=[
@@ -78,11 +79,7 @@ def parse_args():
         ],
         default="random",
     )
-    parser.add_argument(
-        "--inner-split-strategy",
-        choices=["random", "y_stratified", "y_equidistant", "group"],
-        default="random",
-    )
+    parser.add_argument( "--inner-split-strategy", choices=["random", "y_stratified", "y_equidistant", "group"], default="random", )
     parser.add_argument("--y-stratify-bins", type=int, default=3)
     parser.add_argument("--ks-test-fraction", type=float, default=0.20)
     parser.add_argument("--split-group-columns", nargs="*", default=[])
@@ -93,17 +90,9 @@ def parse_args():
     parser.add_argument("--max-features-cap", type=int, default=10)
     parser.add_argument("--corr-threshold", type=float, default=0.75)
     parser.add_argument("--overfit-penalty-weight", type=float, default=1.0)
-    parser.add_argument(
-        "--optimize-metric",
-        choices=["r2", "rmse", "mae"],
-        default="r2",
-    )
+    parser.add_argument( "--optimize-metric", choices=["r2", "rmse", "mae"], default="r2", )
     parser.add_argument("--random-state", type=int, default=42)
-    parser.add_argument(
-        "--models",
-        nargs="+",
-        default=["MLR", "Ridge", "Lasso", "BRR", "KRR", "SVR", "KNN", "RF", "XGB"],
-    )
+    parser.add_argument( "--models", nargs="+", default=["MLR", "Ridge", "Lasso", "BRR", "KRR", "SVR", "KNN", "RF", "XGB"], )
     parser.add_argument("--plot-correlation-matrix", action="store_true")
     parser.add_argument("--plot-response-distribution", action="store_true")
     parser.add_argument("--response-distribution-bins", type=int, default=15)
@@ -124,17 +113,9 @@ def parse_args():
     parser.add_argument("--feature-frequency-top-n", type=int, default=15)
     parser.add_argument("--feature-histogram-bins", type=int, default=15)
     parser.add_argument("--feature-histogram-top-n", type=int, default=10)
-    parser.add_argument(
-        "--feature-target-method",
-        choices=["pearson", "spearman"],
-        default="pearson",
-    )
+    parser.add_argument( "--feature-target-method", choices=["pearson", "spearman"], default="pearson", )
     parser.add_argument("--feature-target-top-n", type=int, default=7)
-    parser.add_argument(
-        "--feature-pair-mode",
-        choices=["representative", "correlation"],
-        default="representative",
-    )
+    parser.add_argument( "--feature-pair-mode", choices=["representative", "correlation"], default="representative", )
     parser.add_argument("--feature-pair-model", default="best")
     parser.add_argument("--feature-pair-top-n", type=int, default=7)
     parser.add_argument("--feature-pair-max-pairs", type=int, default=10)
@@ -154,11 +135,7 @@ def parse_args():
     parser.add_argument("--external-file", default=None)
     parser.add_argument("--external-sheet", default="Sheet1")
     parser.add_argument("--external-models", nargs="*", default=["all"])
-    parser.add_argument(
-        "--figure-format",
-        choices=["svg", "png", "pdf"],
-        default="svg",
-    )
+    parser.add_argument( "--figure-format", choices=["svg", "png", "pdf"], default="svg", )
     parser.add_argument("--figure-dpi", type=int, default=300)
     return parser.parse_args()
 
@@ -173,7 +150,6 @@ def resolve_models(specification, results):
 
 def main() -> None:
     args = parse_args()
-
     if args.outer_n_splits < 2 or args.inner_cv_splits < 2:
         raise ValueError("Outer and inner split counts must be at least 2.")
     if args.n_trials < 1:
@@ -192,11 +168,7 @@ def main() -> None:
     output_prefix = args.output_prefix or excel_file.stem
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    metadata_columns = list(dict.fromkeys(
-        args.metadata_columns
-        + args.split_group_columns
-        + ([args.predefined_split_column] if args.predefined_split_column else [])
-    ))
+    metadata_columns = list(dict.fromkeys( args.metadata_columns + args.split_group_columns + ([args.predefined_split_column] if args.predefined_split_column else []) ))
 
     plot_settings = {
         "font_size": 8,
@@ -238,11 +210,9 @@ def main() -> None:
         id_columns=args.id_columns,
         drop_columns=args.drop_columns,
         metadata_columns=metadata_columns,
+        round_digits=args.round_digits,
     )
-    print(
-        f"Loaded dataset: {X.shape[0]} rows, {X.shape[1]} features.",
-        flush=True,
-    )
+    print( f"Loaded dataset: {X.shape[0]} rows, {X.shape[1]} features.", flush=True, )
 
     if args.plot_response_distribution:
         plot_target_distribution(
@@ -257,14 +227,7 @@ def main() -> None:
         )
 
     if args.plot_correlation_matrix:
-        plot_correlation_heatmap(
-            X=X,
-            results_dir=results_dir,
-            output_prefix=output_prefix,
-            save_figures=True,
-            show_figures=False,
-            plot_settings=plot_settings,
-        )
+        plot_correlation_heatmap( X=X, results_dir=results_dir, output_prefix=output_prefix, save_figures=True, show_figures=False, plot_settings=plot_settings, )
 
     results = run_nested_regression(
         X=X,
@@ -294,18 +257,16 @@ def main() -> None:
         export_split_indices=False,
         export_test_groups=False,
         max_test_groups_to_export=3,
+        rfe_step=args.rfe_step,
+        n_jobs=args.n_jobs,
+        one_se=args.one_se,
     )
 
     configuration = vars(args).copy()
     configuration["excel_file"] = str(excel_file)
     configuration["results_dir"] = str(results_dir)
 
-    export_workflow_results(
-        results=results,
-        output_file=results_dir / f"ML_results_{output_prefix}.xlsx",
-        save_excel=True,
-        configuration=configuration,
-    )
+    export_workflow_results( results=results, output_file=results_dir / f"ML_results_{output_prefix}.xlsx", save_excel=True, configuration=configuration, )
 
     if args.plot_split_distribution:
         plot_target_split_distribution(
@@ -381,14 +342,7 @@ def main() -> None:
         )
 
     if args.plot_selector_frequencies:
-        plot_selector_frequency(
-            results=results,
-            results_dir=results_dir,
-            output_prefix=output_prefix,
-            save_figures=True,
-            show_figures=False,
-            plot_settings=plot_settings,
-        )
+        plot_selector_frequency( results=results, results_dir=results_dir, output_prefix=output_prefix, save_figures=True, show_figures=False, plot_settings=plot_settings, )
 
     if args.plot_feature_frequencies:
         plot_feature_frequency(
@@ -401,20 +355,11 @@ def main() -> None:
             plot_settings=plot_settings,
         )
 
-    correlations = compute_feature_target_correlations(
-        X=X,
-        y=y,
-        method=args.feature_target_method,
-    )
-    correlations.to_excel(
-        results_dir / f"Feature_target_correlations_{output_prefix}.xlsx",
-        index=False,
-    )
+    correlations = compute_feature_target_correlations( X=X, y=y, method=args.feature_target_method, )
+    correlations.to_excel( results_dir / f"Feature_target_correlations_{output_prefix}.xlsx", index=False, )
 
     if args.plot_feature_histograms:
-        features = correlations["Feature"].head(
-            args.feature_histogram_top_n
-        ).tolist()
+        features = correlations["Feature"].head( args.feature_histogram_top_n ).tolist()
         plot_feature_histograms(
             X=X,
             results_dir=results_dir,
@@ -452,24 +397,11 @@ def main() -> None:
 
     if args.plot_feature_pairs:
         if args.feature_pair_mode == "correlation":
-            pair_features = correlations["Feature"].head(
-                args.feature_pair_top_n
-            ).tolist()
+            pair_features = correlations["Feature"].head( args.feature_pair_top_n ).tolist()
         else:
-            model_name = (
-                results["summary_mean"].iloc[0]["Model"]
-                if args.feature_pair_model == "best"
-                else args.feature_pair_model
-            )
-            pair_features = results["representative_features"].get(
-                model_name,
-                [],
-            )[:args.feature_pair_top_n]
-        feature_pairs = make_feature_pairs(
-            pair_features,
-            args.feature_pair_max_pairs,
-            args.feature_pair_adjacent_only,
-        )
+            model_name = ( results["summary_mean"].iloc[0]["Model"] if args.feature_pair_model == "best" else args.feature_pair_model )
+            pair_features = results["representative_features"].get( model_name, [], )[:args.feature_pair_top_n]
+        feature_pairs = make_feature_pairs( pair_features, args.feature_pair_max_pairs, args.feature_pair_adjacent_only, )
         if feature_pairs:
             plot_feature_pairs(
                 X=X,
@@ -509,19 +441,10 @@ def main() -> None:
                 show_figures=False,
                 plot_settings=plot_settings,
             )
-        save_ensemble_shap_results(
-            shap_results=shap_results,
-            output_file=(
-                results_dir / f"Ensemble_SHAP_train_{output_prefix}.xlsx"
-            ),
-            save_excel=True,
-        )
+        save_ensemble_shap_results( shap_results=shap_results, output_file=( results_dir / f"Ensemble_SHAP_train_{output_prefix}.xlsx" ), save_excel=True, )
 
     if args.screening_file:
-        screening_data = pd.read_excel(
-            args.screening_file,
-            sheet_name=args.screening_sheet,
-        )
+        screening_data = pd.read_excel( args.screening_file, sheet_name=args.screening_sheet, )
         screening_models = resolve_models(args.screening_models, results)
         screening_predictions, _ = evaluate_external_dataset(
             df_external=screening_data,
@@ -533,10 +456,7 @@ def main() -> None:
             model_names=screening_models,
             include_prediction_std=True,
         )
-        screening_predictions.to_excel(
-            results_dir / f"Virtual_screening_{output_prefix}.xlsx",
-            index=False,
-        )
+        screening_predictions.to_excel( results_dir / f"Virtual_screening_{output_prefix}.xlsx", index=False, )
         if args.plot_screening_distribution:
             plot_virtual_screening_distribution(
                 y_training=y,
@@ -552,10 +472,7 @@ def main() -> None:
             )
 
     if args.external_file:
-        external_data = pd.read_excel(
-            args.external_file,
-            sheet_name=args.external_sheet,
-        )
+        external_data = pd.read_excel( args.external_file, sheet_name=args.external_sheet, )
         external_models = resolve_models(args.external_models, results)
         external_predictions, external_metrics = evaluate_external_dataset(
             df_external=external_data,

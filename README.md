@@ -2,8 +2,8 @@
 
 Created by: Pauline Bianchi (May 1, 2026)  
 Edited by: Samantha Sloane and Pauline Bianchi  
-Last update: August 14, 2026  
-Sigman Lab, University of Utah, Version 1.0
+Last update: November 2, 2026  
+Sigman Lab, University of Utah, Version 1.1
 
 This repository contains two parallel data science workflows for chemical datasets:
 
@@ -101,6 +101,8 @@ The workflows retain two distinct ensemble objects:
 - `results["full_models_dict"]`: corresponding pipelines refitted on the complete training dataset. These are used for deployment-oriented tasks such as SHAP, external prediction, and virtual screening.
 
 This separation prevents the full-training refit from being confused with unbiased out-of-fold evaluation.
+
+Optionally, the one-standard-error rule can select the smallest feature set whose mean inner-validation score is within one standard error of the best candidate.
 
 ### Selection of the `best` model
 
@@ -227,6 +229,10 @@ Typical parameters include:
 - Scoring metric for the optimization;
 - feature-selection bounds;
 - correlation threshold;
+- RFE step size (`rfe_step`);
+- parallel outer folds (`n_jobs`);
+- optional one-standard-error selection (`one_se`);
+- numerical precision (`round_digits`);
 - output directory;
 - plotting and SHAP options.
 
@@ -264,6 +270,10 @@ python bo_regression.py \
     --inner-cv-splits 2 \
     --inner-cv-repeats 2 \
     --n-trials 5 \
+    --n-jobs 1 \
+    --rfe-step 0.1 \
+    --one-se \
+    --round-digits 15 \
     --outer-split-strategy random \
     --inner-split-strategy random \
     --min-features 4 \
@@ -306,6 +316,10 @@ python bo_classification.py \
     --inner-cv-splits 2 \
     --inner-cv-repeats 2 \
     --n-trials 5 \
+    --n-jobs 1 \
+    --rfe-step 0.1 \
+    --one-se \
+    --round-digits 15 \
     --outer-split-strategy random \
     --inner-split-strategy random \
     --min-features 4 \
@@ -353,14 +367,14 @@ Depending on the enabled options, each run can generate Excel workbooks containi
 - configuration;
 - summary metrics;
 - fold-level metrics;
-- out-of-fold predictions;
-- full-training ensemble predictions;
+- out-of-fold predictions, including per-sample prediction standard deviation for repeated regression OOF predictions;
+- full-training ensemble predictions, including per-sample prediction standard deviation for regression;
 - optimized hyperparameters;
 - selected features;
 - feature-selection frequencies;
 - split assignments;
 - threshold summaries for classification;
-- external predictions;
+- external predictions, including regression ensemble prediction uncertainty when enabled;
 - SHAP values and global importance.
 
 Figures may include:
@@ -368,7 +382,7 @@ Figures may include:
 - response-variable distributions;
 - correlation heatmaps;
 - target split distributions;
-- parity plots;
+- regression parity plots with per-point ±1 SD uncertainty and 95% confidence bands around the regression fit;
 - model comparisons;
 - train-validation gaps;
 - full-training ensemble parity plots;
@@ -377,7 +391,7 @@ Figures may include:
 - feature-pair plots;
 - confusion matrices;
 - threshold stability plots;
-- classification feature maps;
+- classification feature maps showing class thresholds on the response axis and corresponding feature thresholds on the descriptor axis;
 - SHAP beeswarm and importance plots.
 
 ---
@@ -392,7 +406,7 @@ Random seeds are controlled through:
 --random-state 42
 ```
 
-Optuna uses seeded TPE samplers.
+Optuna uses seeded TPE samplers. Numerical inputs are rounded to a fixed number of decimal places before modeling (`round_digits`, default: 15) to reduce sensitivity to platform-dependent last-digit differences. Outer folds can be parallelized with `n_jobs`; Optuna trials remain sequential.
 
 Exact results may still depend on:
 
@@ -400,6 +414,10 @@ Exact results may still depend on:
 - operating system;
 - cluster hardware;
 - the internal behavior of multithreaded numerical libraries.
+
+#### Small datasets
+
+Small datasets are particularly sensitive to small numerical differences and to the exact cross-validation split. For datasets with fewer than approximately 20 observations, it is recommended to use at least 5 outer repeats to assess the stability of the reported performance and predictions. Repeated inner cross-validation is also important for model and feature-selection stability: at least 2 inner repeats are recommended when the dataset size permits it. Increasing the number of Optuna trials is not a substitute for repeated validation: on very small datasets, a larger hyperparameter search can increase the risk of overfitting the inner cross-validation splits.
 
 ### 7.2. Data requirements
 

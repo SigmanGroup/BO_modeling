@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import re
+from joblib import Parallel, delayed, parallel_backend
 from typing import Any, Iterable
 
 import matplotlib.pyplot as plt
@@ -34,7 +35,7 @@ import numpy as np
 import optuna
 import pandas as pd
 
-from scipy.stats import pearsonr, spearmanr
+from scipy.stats import pearsonr, spearmanr, t
 
 from sklearn.base import BaseEstimator, TransformerMixin, clone
 from sklearn.ensemble import RandomForestRegressor
@@ -50,28 +51,26 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVR
 from xgboost import XGBRegressor
 
+import warnings
+import logging
+from sklearn.exceptions import ConvergenceWarning
+
+warnings.filterwarnings("ignore", category=ConvergenceWarning)
+warnings.filterwarnings("ignore", category=RuntimeWarning, message="invalid value encountered in divide")
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+logging.getLogger("optuna").setLevel(logging.WARNING)
+
 ### 1. Data loading and validation ###
 def safe_rmse(y_true: Iterable[float], y_pred: Iterable[float]) -> float:
     return float(np.sqrt(mean_squared_error(y_true, y_pred)))
 
 
-def evaluate_regression(
-    y_true: Iterable[float],
-    y_pred: Iterable[float],
-) -> dict[str, float]:
+def evaluate_regression( y_true: Iterable[float], y_pred: Iterable[float], ) -> dict[str, float]:
     """Return the common regression metrics used throughout the workflow."""
-    return {
-        "r2": float(r2_score(y_true, y_pred)),
-        "rmse": safe_rmse(y_true, y_pred),
-        "mae": float(mean_absolute_error(y_true, y_pred)),
-    }
+    return { "r2": float(r2_score(y_true, y_pred)), "rmse": safe_rmse(y_true, y_pred), "mae": float(mean_absolute_error(y_true, y_pred)), }
 
 
-def regression_optimization_score(
-    y_true: Iterable[float],
-    y_pred: Iterable[float],
-    metric: str,
-) -> float:
+def regression_optimization_score( y_true: Iterable[float], y_pred: Iterable[float], metric: str, ) -> float:
     """Convert the selected regression metric to an Optuna maximization score."""
     metric = metric.lower()
     metrics = evaluate_regression(y_true, y_pred)
@@ -91,6 +90,7 @@ def load_regression_data(
     id_columns: list[str] | None = None,
     drop_columns: list[str] | None = None,
     metadata_columns: list[str] | None = None,
+    round_digits: int = 15,
 ) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
     """Load numeric regression data and retain identifiers/split metadata."""
     id_columns = id_columns or []
@@ -113,6 +113,8 @@ def load_regression_data(
     X=X.loc[valid].reset_index(drop=True)
     y=y.loc[valid].reset_index(drop=True)
     metadata=metadata.loc[valid].reset_index(drop=True)
+    X = X.round(round_digits)
+    y = y.round(round_digits)
     if X.empty: raise ValueError('No complete numeric rows remain after cleaning.')
     return X,y,metadata
 
@@ -128,26 +130,17 @@ def prepare_external_features(
     drop_columns = drop_columns or []
     training_columns = list(training_columns)
 
-    X_external = df_external.drop(
-        columns=[target_column] + id_columns + drop_columns,
-        errors="ignore",
-    )
+    X_external = df_external.drop( columns=[target_column] + id_columns + drop_columns, errors="ignore", )
     X_external = X_external.apply(pd.to_numeric, errors="coerce")
 
     missing_columns = [c for c in training_columns if c not in X_external.columns]
     if missing_columns:
-        raise ValueError(
-            f"External dataset is missing {len(missing_columns)} required features: "
-            f"{missing_columns}"
-        )
+        raise ValueError( f"External dataset is missing {len(missing_columns)} required features: " f"{missing_columns}" )
 
     X_external = X_external.loc[:, training_columns].reset_index(drop=True)
     nan_columns = X_external.columns[X_external.isna().any()].tolist()
     if nan_columns:
-        raise ValueError(
-            "External dataset contains missing or non-numeric values in: "
-            f"{nan_columns}"
-        )
+        raise ValueError( "External dataset contains missing or non-numeric values in: " f"{nan_columns}" )
 
     return X_external
 
@@ -194,9 +187,7 @@ class CorrelationFilter(BaseEstimator, TransformerMixin):
         # Restore original column order for predictable downstream output.
         selected_set = set(selected)
         self.selected_features_ = [c for c in X_df.columns if c in selected_set]
-        self.support_mask_ = np.asarray(
-            [c in selected_set for c in X_df.columns], dtype=bool
-        )
+        self.support_mask_ = np.asarray( [c in selected_set for c in X_df.columns], dtype=bool )
         return self
 
     def transform(self, X: pd.DataFrame | np.ndarray) -> pd.DataFrame:
@@ -243,16 +234,13 @@ class SafeRFE(RFE):
             self.n_features_to_select = requested_n
 
 ### 3. Model and feature-selector factories ###
-def build_model_from_trial(model_name: str, trial: optuna.Trial, random_state: int = 42):
+def build_model_from_trial(model_name: str, trial: optuna.Trial, random_state: int = 42, n_jobs: int = 1):
     if model_name == "MLR":
         return LinearRegression()
     if model_name == "Ridge":
         return Ridge(alpha=trial.suggest_float("alpha", 1e-3, 100, log=True))
     if model_name == "Lasso":
-        return Lasso(
-            alpha=trial.suggest_float("alpha", 1e-3, 100, log=True),
-            max_iter=50000,
-        )
+        return Lasso( alpha=trial.suggest_float("alpha", 1e-3, 100, log=True), max_iter=50000, )
     if model_name == "BRR":
         return BayesianRidge(
             alpha_1=trial.suggest_float("alpha_1", 1e-8, 1e-2, log=True),
@@ -274,10 +262,7 @@ def build_model_from_trial(model_name: str, trial: optuna.Trial, random_state: i
             kernel=trial.suggest_categorical("kernel", ["rbf", "linear"]),
         )
     if model_name == "KNN":
-        return KNeighborsRegressor(
-            n_neighbors=trial.suggest_int("n_neighbors", 1, 5),
-            weights=trial.suggest_categorical("weights", ["uniform", "distance"]),
-        )
+        return KNeighborsRegressor( n_neighbors=trial.suggest_int("n_neighbors", 1, 5), weights=trial.suggest_categorical("weights", ["uniform", "distance"]), )
     if model_name == "RF":
         return RandomForestRegressor(
             n_estimators=trial.suggest_int("n_estimators", 20, 200),
@@ -286,7 +271,7 @@ def build_model_from_trial(model_name: str, trial: optuna.Trial, random_state: i
             min_samples_split=trial.suggest_int("min_samples_split", 4, 12),
             max_features=trial.suggest_categorical("max_features", ["sqrt", "log2"]),
             random_state=random_state,
-            n_jobs=1,
+            n_jobs=n_jobs,
         )
     if model_name == "XGB":
         return XGBRegressor(
@@ -300,7 +285,7 @@ def build_model_from_trial(model_name: str, trial: optuna.Trial, random_state: i
             reg_lambda=trial.suggest_float("reg_lambda", 1e-2, 100, log=True),
             min_child_weight=trial.suggest_float("min_child_weight", 1, 20),
             random_state=random_state,
-            n_jobs=1,
+            n_jobs=n_jobs,
         )
     if model_name == "NN":
         return MLPRegressor(
@@ -336,11 +321,7 @@ def remove_feature_selection_params(params: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in params.items() if k not in fs_params}
 
 
-def build_final_model_from_params(
-    model_name: str,
-    params: dict[str, Any],
-    random_state: int = 42,
-):
+def build_final_model_from_params(model_name: str, params: dict[str, Any], random_state: int = 42, n_jobs: int = 1):
     params = remove_feature_selection_params(dict(params))
     if model_name == "MLR":
         return LinearRegression()
@@ -357,43 +338,20 @@ def build_final_model_from_params(
     if model_name == "KNN":
         return KNeighborsRegressor(**params)
     if model_name == "RF":
-        return RandomForestRegressor(**params, random_state=random_state, n_jobs=1)
+        return RandomForestRegressor(**params, random_state=random_state, n_jobs=n_jobs)
     if model_name == "XGB":
-        return XGBRegressor(
-            **params,
-            objective="reg:squarederror",
-            random_state=random_state,
-            n_jobs=1,
-        )
+        return XGBRegressor( **params, objective="reg:squarederror", random_state=random_state, n_jobs=n_jobs, )
     if model_name == "NN":
-        return MLPRegressor(
-            **params,
-            early_stopping=True,
-            validation_fraction=0.2,
-            n_iter_no_change=30,
-            max_iter=3000,
-            random_state=random_state,
-        )
+        return MLPRegressor( **params, early_stopping=True, validation_fraction=0.2, n_iter_no_change=30, max_iter=3000, random_state=random_state, )
     raise ValueError(f"Unknown model: {model_name}")
 
 
-def build_feature_selector_from_trial(
-    trial: optuna.Trial,
-    max_features_cap: int,
-    min_features: int = 1,
-    random_state: int = 42,
-):
+def build_feature_selector_from_trial(trial: optuna.Trial, max_features_cap: int, min_features: int = 1, random_state: int = 42, rfe_step: int | float = 1, n_jobs: int = 1):
     min_features = max(1, min(int(min_features), int(max_features_cap)))
-    selector_name = trial.suggest_categorical(
-        "feature_selector",
-        ["selectkbest", "lasso_feature", "rf_feature", "rfe_feature"],
-    )
+    selector_name = trial.suggest_categorical( "feature_selector", ["selectkbest", "lasso_feature", "rf_feature", "rfe_feature"], )
 
     if selector_name == "selectkbest":
-        selector = SafeSelectKBest(
-            score_func=f_regression,
-            k=trial.suggest_int("selectkbest_k", min_features, max_features_cap),
-        )
+        selector = SafeSelectKBest( score_func=f_regression, k=trial.suggest_int("selectkbest_k", min_features, max_features_cap), )
     elif selector_name == "lasso_feature":
         selector = SelectFromModel(
             estimator=Lasso(
@@ -411,7 +369,7 @@ def build_feature_selector_from_trial(
                 n_estimators=trial.suggest_int("rf_n_estimators_feature", 20, 200),
                 max_depth=trial.suggest_int("rf_max_depth_feature", 1, 5),
                 random_state=random_state,
-                n_jobs=1,
+                n_jobs=n_jobs,
             ),
             threshold=trial.suggest_categorical(
                 "rf_threshold_feature", ["mean", "median"]
@@ -426,6 +384,7 @@ def build_feature_selector_from_trial(
             n_features_to_select=trial.suggest_int(
                 "rfe_n_features", min_features, max_features_cap
             ),
+            step=rfe_step,
         )
     else:
         raise ValueError(f"Unknown feature selector: {selector_name}")
@@ -441,11 +400,7 @@ def get_selected_feature_names(fitted_pipe: Pipeline) -> list[str]:
     return list(names)
 
 ### 4. Split-generation strategies ###
-def _make_y_bins(
-    y: pd.Series,
-    requested_bins: int,
-    n_splits: int,
-) -> np.ndarray:
+def _make_y_bins( y: pd.Series, requested_bins: int, n_splits: int, ) -> np.ndarray:
     """Create quantile bins with enough observations for stratified folds."""
     max_bins = min(int(requested_bins), int(pd.Series(y).nunique()))
 
@@ -455,32 +410,18 @@ def _make_y_bins(
         if len(counts) >= 2 and counts.min() >= n_splits:
             return np.asarray(bins, dtype=int)
 
-    raise ValueError(
-        "Could not create y-stratification bins with at least "
-        f"{n_splits} observations per bin."
-    )
+    raise ValueError( "Could not create y-stratification bins with at least " f"{n_splits} observations per bin." )
 
 
-def _repeated_group_splits(
-    groups: Iterable[Any],
-    n_splits: int,
-    n_repeats: int,
-    random_state: int,
-):
+def _repeated_group_splits( groups: Iterable[Any], n_splits: int, n_repeats: int, random_state: int, ):
     """Repeated group-wise folds with approximately balanced row counts."""
     groups = np.asarray(groups)
     unique_groups = np.asarray(pd.unique(groups))
 
     if len(unique_groups) < n_splits:
-        raise ValueError(
-            f"Group split requires at least {n_splits} unique groups; "
-            f"found {len(unique_groups)}."
-        )
+        raise ValueError( f"Group split requires at least {n_splits} unique groups; " f"found {len(unique_groups)}." )
 
-    group_sizes = {
-        group: int(np.sum(groups == group))
-        for group in unique_groups
-    }
+    group_sizes = { group: int(np.sum(groups == group)) for group in unique_groups }
     rng = np.random.RandomState(random_state)
 
     for _ in range(n_repeats):
@@ -490,11 +431,7 @@ def _repeated_group_splits(
         fold_groups = [[] for _ in range(n_splits)]
         fold_sizes = np.zeros(n_splits, dtype=int)
 
-        for group in sorted(
-            shuffled,
-            key=lambda value: group_sizes[value],
-            reverse=True,
-        ):
+        for group in sorted( shuffled, key=lambda value: group_sizes[value], reverse=True, ):
             fold_index = int(np.argmin(fold_sizes))
             fold_groups[fold_index].append(group)
             fold_sizes[fold_index] += group_sizes[group]
@@ -504,12 +441,7 @@ def _repeated_group_splits(
             yield np.flatnonzero(~test_mask), np.flatnonzero(test_mask)
 
 
-def _y_equidistant_splits(
-    y: pd.Series,
-    n_splits: int,
-    n_repeats: int,
-    random_state: int,
-):
+def _y_equidistant_splits( y: pd.Series, n_splits: int, n_repeats: int, random_state: int, ):
     """Distribute sorted y values across folds so every fold spans the y range."""
     y_values = np.asarray(y, dtype=float)
     rng = np.random.RandomState(random_state)
@@ -532,10 +464,7 @@ def _y_equidistant_splits(
             yield train_index, test_index
 
 
-def kennard_stone_indices(
-    X: pd.DataFrame,
-    test_fraction: float = 0.20,
-) -> tuple[np.ndarray, np.ndarray]:
+def kennard_stone_indices( X: pd.DataFrame, test_fraction: float = 0.20, ) -> tuple[np.ndarray, np.ndarray]:
     """Create one Kennard–Stone holdout split using standardized X distances."""
     if not 0 < test_fraction < 1:
         raise ValueError("ks_test_fraction must be between 0 and 1.")
@@ -552,11 +481,7 @@ def kennard_stone_indices(
         raise ValueError("Kennard–Stone test set must be smaller than the dataset.")
 
     squared_norms = np.sum(standardized ** 2, axis=1)
-    distances = (
-        squared_norms[:, None]
-        + squared_norms[None, :]
-        - 2 * standardized @ standardized.T
-    )
+    distances = ( squared_norms[:, None] + squared_norms[None, :] - 2 * standardized @ standardized.T )
     np.maximum(distances, 0, out=distances)
 
     first, second = np.unravel_index(np.argmax(distances), distances.shape)
@@ -570,25 +495,15 @@ def kennard_stone_indices(
     while len(selected) < n_test:
         next_index = int(np.argmax(minimum_distance))
         selected.append(next_index)
-        minimum_distance = np.minimum(
-            minimum_distance,
-            distances[:, next_index],
-        )
+        minimum_distance = np.minimum( minimum_distance, distances[:, next_index], )
         minimum_distance[selected] = -np.inf
 
     test_index = np.asarray(sorted(selected), dtype=int)
-    train_index = np.setdiff1d(
-        np.arange(n_samples),
-        test_index,
-        assume_unique=True,
-    )
+    train_index = np.setdiff1d( np.arange(n_samples), test_index, assume_unique=True, )
     return train_index, test_index
 
 
-def _predefined_splits(
-    labels: Iterable[Any],
-    train_label: Any = "train",
-):
+def _predefined_splits( labels: Iterable[Any], train_label: Any = "train", ):
     """Build user-defined train/test splits from a metadata column."""
     labels = pd.Series(labels).reset_index(drop=True)
     if labels.isna().any():
@@ -599,40 +514,19 @@ def _predefined_splits(
     train_label_normalized = str(train_label).lower()
 
     if train_label_normalized in set(normalized):
-        train_index = np.flatnonzero(
-            normalized.to_numpy() == train_label_normalized
-        )
-        test_labels = [
-            label
-            for label in unique_labels
-            if str(label).lower() != train_label_normalized
-        ]
+        train_index = np.flatnonzero( normalized.to_numpy() == train_label_normalized )
+        test_labels = [ label for label in unique_labels if str(label).lower() != train_label_normalized ]
         if not test_labels:
-            raise ValueError(
-                "The predefined split column contains a train label but no test label."
-            )
-        return [
-            (
-                train_index,
-                np.flatnonzero(labels.to_numpy() == test_label),
-            )
-            for test_label in test_labels
-        ]
+            raise ValueError( "The predefined split column contains a train label but no test label." )
+        return [ ( train_index, np.flatnonzero(labels.to_numpy() == test_label), ) for test_label in test_labels ]
 
     if len(unique_labels) < 2:
-        raise ValueError(
-            "The predefined split column must contain at least two labels."
-        )
+        raise ValueError( "The predefined split column must contain at least two labels." )
 
     splits = []
     for test_label in unique_labels:
         test_mask = labels.to_numpy() == test_label
-        splits.append(
-            (
-                np.flatnonzero(~test_mask),
-                np.flatnonzero(test_mask),
-            )
-        )
+        splits.append( ( np.flatnonzero(~test_mask), np.flatnonzero(test_mask), ) )
     return splits
 
 
@@ -654,88 +548,44 @@ def make_regression_splits(
     strategy = strategy.lower()
 
     if strategy == "random":
-        splitter = RepeatedKFold(
-            n_splits=n_splits,
-            n_repeats=n_repeats,
-            random_state=random_state,
-        )
+        splitter = RepeatedKFold( n_splits=n_splits, n_repeats=n_repeats, random_state=random_state, )
         return list(splitter.split(X))
 
     if strategy == "y_stratified":
         y_bins = _make_y_bins(y, y_stratify_bins, n_splits)
-        splitter = RepeatedStratifiedKFold(
-            n_splits=n_splits,
-            n_repeats=n_repeats,
-            random_state=random_state,
-        )
+        splitter = RepeatedStratifiedKFold( n_splits=n_splits, n_repeats=n_repeats, random_state=random_state, )
         return list(splitter.split(X, y_bins))
 
     if strategy == "y_equidistant":
-        return list(
-            _y_equidistant_splits(
-                y=y,
-                n_splits=n_splits,
-                n_repeats=n_repeats,
-                random_state=random_state,
-            )
-        )
+        return list( _y_equidistant_splits( y=y, n_splits=n_splits, n_repeats=n_repeats, random_state=random_state, ) )
 
     if strategy in {"group", "cluster"}:
         if groups is None:
-            raise ValueError(
-                "A group split requires group labels."
-            )
+            raise ValueError( "A group split requires group labels." )
         if pd.Series(groups).isna().any():
             raise ValueError("Group labels contain missing values.")
-        return list(
-            _repeated_group_splits(
-                groups=groups,
-                n_splits=n_splits,
-                n_repeats=n_repeats,
-                random_state=random_state,
-            )
-        )
+        return list( _repeated_group_splits( groups=groups, n_splits=n_splits, n_repeats=n_repeats, random_state=random_state, ) )
 
     if strategy == "leave_group_out":
         if groups is None or not held_out_groups:
-            raise ValueError(
-                "leave_group_out requires split_group_column and held_out_groups."
-            )
+            raise ValueError( "leave_group_out requires split_group_column and held_out_groups." )
         group_series = pd.Series(groups).reset_index(drop=True)
         test_mask = group_series.isin(held_out_groups).to_numpy()
         if not test_mask.any():
             raise ValueError("None of the held_out_groups were found.")
         if test_mask.all():
             raise ValueError("held_out_groups contains every observation.")
-        return [
-            (
-                np.flatnonzero(~test_mask),
-                np.flatnonzero(test_mask),
-            )
-        ]
+        return [ ( np.flatnonzero(~test_mask), np.flatnonzero(test_mask), ) ]
 
     if strategy == "predefined":
         if predefined_labels is None:
-            raise ValueError(
-                "predefined split requires predefined_split_column."
-            )
-        return _predefined_splits(
-            labels=predefined_labels,
-            train_label=predefined_train_label,
-        )
+            raise ValueError( "predefined split requires predefined_split_column." )
+        return _predefined_splits( labels=predefined_labels, train_label=predefined_train_label, )
 
     if strategy in {"ks", "ks_holdout"}:
-        return [
-            kennard_stone_indices(
-                X=X,
-                test_fraction=ks_test_fraction,
-            )
-        ]
+        return [ kennard_stone_indices( X=X, test_fraction=ks_test_fraction, ) ]
 
-    raise ValueError(
-        "Unknown split strategy. Choose: random, y_stratified, "
-        "y_equidistant, group, leave_group_out, predefined, or ks_holdout."
-    )
+    raise ValueError( "Unknown split strategy. Choose: random, y_stratified, " "y_equidistant, group, leave_group_out, predefined, or ks_holdout." )
 
 
 ### 5. Inner optimization and outer-fold training ###
@@ -757,6 +607,9 @@ def train_outer_fold(
     inner_split_strategy: str = "random",
     inner_groups: Iterable[Any] | None = None,
     y_stratify_bins: int = 5,
+    rfe_step: int | float = 1,
+    one_se: bool = False,
+    n_jobs: int = 1,
 ):
     # The inner splits are created only from the current outer-training set.
     # They are used exclusively for Optuna model/selector selection.
@@ -775,29 +628,14 @@ def train_outer_fold(
         # One Optuna trial defines both a feature-selection strategy and the
         # model hyperparameters. The complete pipeline is then refitted inside
         # every inner fold so preprocessing never sees validation observations.
-        selector, _ = build_feature_selector_from_trial(
-            trial,
-            max_features_cap=max_features_cap,
-            min_features=min_features,
-            random_state=random_state,
-        )
-        model = build_model_from_trial(
-            model_name,
-            trial,
-            random_state=random_state,
-        )
+        selector, _ = build_feature_selector_from_trial(trial, max_features_cap=max_features_cap, min_features=min_features, random_state=random_state, rfe_step=rfe_step, n_jobs=n_jobs)
+        model = build_model_from_trial(model_name, trial, random_state=random_state, n_jobs=n_jobs)
 
-        pipe = Pipeline(
-            [
-                ("correlation_filter", CorrelationFilter(corr_threshold)),
-                ("scaler", StandardScaler()),
-                ("selector", selector),
-                ("model", model),
-            ]
-        )
+        pipe = Pipeline( [ ("correlation_filter", CorrelationFilter(corr_threshold)), ("scaler", StandardScaler()), ("selector", selector), ("model", model), ] )
 
         train_scores = []
         validation_scores = []
+        feature_counts = []
 
         for train_index, validation_index in inner_splits:
             X_train = X_train_outer.iloc[train_index]
@@ -807,16 +645,9 @@ def train_outer_fold(
 
             try:
                 pipe.fit(X_train, y_train)
-                train_scores.append(
-                    regression_optimization_score(
-                        y_train, pipe.predict(X_train), optimize_metric
-                    )
-                )
-                validation_scores.append(
-                    regression_optimization_score(
-                        y_validation, pipe.predict(X_validation), optimize_metric
-                    )
-                )
+                feature_counts.append(len(get_selected_feature_names(pipe)))
+                train_scores.append( regression_optimization_score( y_train, pipe.predict(X_train), optimize_metric ) )
+                validation_scores.append( regression_optimization_score( y_validation, pipe.predict(X_validation), optimize_metric ) )
             except Exception:
                 return -1e9
 
@@ -826,47 +657,34 @@ def train_outer_fold(
         if np.isnan(mean_validation):
             return -1e9
 
-        # Penalize trials whose inner-training score is substantially better
-        # than their inner-validation score. This is a ranking penalty only; it
-        # does not alter the final reported outer-validation metrics.
+        # Penalize trials when the inner-training score exceeds the inner-validation score; reported outer metrics are unchanged.
         overfit_penalty = max(0.0, mean_train - mean_validation)
-        return (
-            mean_validation
-            - overfit_penalty_weight * overfit_penalty
-        )
+        trial.set_user_attr("n_features", float(np.mean(feature_counts)))
+        trial.set_user_attr("validation_mean", mean_validation)
+        trial.set_user_attr("validation_se", float(np.std(validation_scores, ddof=1) / np.sqrt(len(validation_scores))) if len(validation_scores) > 1 else 0.0)
+        return mean_validation - overfit_penalty_weight * overfit_penalty
 
     sampler = optuna.samplers.TPESampler(seed=random_state)
     study = optuna.create_study(direction="maximize", sampler=sampler)
-    study.optimize(
-        objective,
-        n_trials=n_trials,
-        show_progress_bar=False,
-    )
+    study.optimize(objective, n_trials=n_trials, n_jobs=1, show_progress_bar=False)
 
-    best_params = study.best_params
+    # Optionally select the smallest model within one standard error of the best inner-validation score.
+    chosen_trial = study.best_trial
+    if one_se:
+        valid_trials = [t for t in study.trials if "validation_mean" in t.user_attrs and "n_features" in t.user_attrs]
+        if valid_trials:
+            best_validation_trial = max(valid_trials, key=lambda t: t.user_attrs["validation_mean"])
+            cutoff = best_validation_trial.user_attrs["validation_mean"] - best_validation_trial.user_attrs.get("validation_se", 0.0)
+            eligible = [t for t in valid_trials if t.user_attrs["validation_mean"] >= cutoff]
+            chosen_trial = min(eligible, key=lambda t: (t.user_attrs["n_features"], -t.user_attrs["validation_mean"]))
+    best_params = chosen_trial.params
     best_selector_name = best_params["feature_selector"]
     fixed_trial = optuna.trial.FixedTrial(best_params)
 
-    final_selector, _ = build_feature_selector_from_trial(
-        fixed_trial,
-        max_features_cap=max_features_cap,
-        min_features=min_features,
-        random_state=random_state,
-    )
-    final_model = build_final_model_from_params(
-        model_name,
-        best_params,
-        random_state=random_state,
-    )
+    final_selector, _ = build_feature_selector_from_trial(fixed_trial, max_features_cap=max_features_cap, min_features=min_features, random_state=random_state, rfe_step=rfe_step, n_jobs=n_jobs)
+    final_model = build_final_model_from_params(model_name, best_params, random_state=random_state, n_jobs=n_jobs)
 
-    final_pipe = Pipeline(
-        [
-            ("correlation_filter", CorrelationFilter(corr_threshold)),
-            ("scaler", StandardScaler()),
-            ("selector", final_selector),
-            ("model", final_model),
-        ]
-    )
+    final_pipe = Pipeline( [ ("correlation_filter", CorrelationFilter(corr_threshold)), ("scaler", StandardScaler()), ("selector", final_selector), ("model", final_model), ] )
     # After Optuna chooses the best trial, refit that complete pipeline on all
     # observations available in the current outer-training fold.
     final_pipe.fit(X_train_outer, y_train_outer)
@@ -912,11 +730,7 @@ class EnsembleModel:
         return self.predict_members(X_input).std(axis=1)
 
 
-def refit_full_training_ensembles(
-    cv_models_dict: dict[str, EnsembleModel],
-    X: pd.DataFrame,
-    y: pd.Series | Iterable[float],
-) -> dict[str, EnsembleModel]:
+def refit_full_training_ensembles( cv_models_dict: dict[str, EnsembleModel], X: pd.DataFrame, y: pd.Series | Iterable[float], ) -> dict[str, EnsembleModel]:
     """Refit every selected outer-fold pipeline on the complete dataset.
 
     The fold ensembles remain reserved for nested-CV/OOF evaluation. The
@@ -978,6 +792,9 @@ def run_nested_regression(
     export_split_indices: bool = False,
     export_test_groups: bool = False,
     max_test_groups_to_export: int = 50,
+    rfe_step: int | float = 1,
+    n_jobs: int = 1,
+    one_se: bool = False,
 ) -> dict[str, Any]:
     """Run nested CV with configurable outer and inner split strategies."""
     max_features_cap=min(max_features_cap,X.shape[1])
@@ -995,19 +812,9 @@ def run_nested_regression(
     summary_results=[]; all_predictions=[]; all_params=[]; all_selected_features=[]; split_manifest=[]; split_assignments=[]; models_dict={}
     for fold_number,(train_index,test_index) in enumerate(outer_splits,start=1):
         for sample_index in train_index:
-            split_assignments.append({
-                "Fold": fold_number,
-                "Sample_ID": int(sample_index),
-                "Set": "Training",
-                "Target": float(y.iloc[int(sample_index)]),
-            })
+            split_assignments.append({ "Fold": fold_number, "Sample_ID": int(sample_index), "Set": "Training", "Target": float(y.iloc[int(sample_index)]), })
         for sample_index in test_index:
-            split_assignments.append({
-                "Fold": fold_number,
-                "Sample_ID": int(sample_index),
-                "Set": "Validation",
-                "Target": float(y.iloc[int(sample_index)]),
-            })
+            split_assignments.append({ "Fold": fold_number, "Sample_ID": int(sample_index), "Set": "Validation", "Target": float(y.iloc[int(sample_index)]), })
 
         row={"Fold":fold_number,"Outer_Split_Strategy":outer_split_strategy,"N_Train":len(train_index),"N_Test":len(test_index)}
         if export_split_indices:
@@ -1021,11 +828,32 @@ def run_nested_regression(
         if predefined_labels is not None:
             row["Test_Predefined_Labels"]=', '.join(map(str,pd.unique(predefined_labels.iloc[test_index])))
         split_manifest.append(row)
-    # Each model family is evaluated on exactly the same outer splits, which
-    # makes the model comparison paired and therefore easier to interpret.
+    def _fit_outer(model_name, global_fold, train_index, test_index):
+        inner_groups = (groups.iloc[train_index].reset_index(drop=True) if groups is not None and inner_split_strategy in {"group", "cluster"} else None)
+        if inner_split_strategy in {"ks", "ks_holdout", "predefined", "leave_group_out"}:
+            raise ValueError(f"{inner_split_strategy!r} is not supported for inner CV")
+        return train_outer_fold(
+            model_name=model_name,
+            X_train_outer=X.iloc[train_index].reset_index(drop=True),
+            y_train_outer=y.iloc[train_index].reset_index(drop=True),
+            X_test_outer=X.iloc[test_index].reset_index(drop=True),
+            y_test_outer=y.iloc[test_index].reset_index(drop=True),
+            inner_cv_splits=inner_cv_splits, inner_cv_repeats=inner_cv_repeats,
+            max_features_cap=max_features_cap, min_features=min_features,
+            corr_threshold=corr_threshold, n_trials=n_trials,
+            overfit_penalty_weight=overfit_penalty_weight,
+            optimize_metric=optimize_metric, random_state=random_state,
+            inner_split_strategy=inner_split_strategy, inner_groups=inner_groups,
+            y_stratify_bins=y_stratify_bins, rfe_step=rfe_step, one_se=one_se, n_jobs=1)
+
     for model_name in model_names:
         if verbose: print(f"\nStarting {model_name}")
         y_true_all=[]; y_pred_all=[]; model_folds=[]
+        if n_jobs > 1:
+            with parallel_backend("loky", inner_max_num_threads=1):
+                fold_results = Parallel(n_jobs=min(n_jobs, len(outer_splits)))( delayed(_fit_outer)(model_name, fold, tr, te) for fold, (tr, te) in enumerate(outer_splits, 1))
+        else:
+            fold_results = None
         for global_fold,(train_index,test_index) in enumerate(outer_splits,start=1):
             if verbose: print(f"  Fold {global_fold}/{len(outer_splits)}")
             inner_groups=groups.iloc[train_index].reset_index(drop=True) if groups is not None and inner_split_strategy in {'group','cluster'} else None
@@ -1033,7 +861,7 @@ def run_nested_regression(
                 raise ValueError(f"'{inner_split_strategy}' is not supported for inner CV.")
             # Tune on the inner CV and evaluate once on this outer validation
             # fold. The returned pipeline becomes one member of the ensemble.
-            result=train_outer_fold(model_name=model_name,X_train_outer=X.iloc[train_index].reset_index(drop=True),y_train_outer=y.iloc[train_index].reset_index(drop=True),X_test_outer=X.iloc[test_index].reset_index(drop=True),y_test_outer=y.iloc[test_index].reset_index(drop=True),inner_cv_splits=inner_cv_splits,inner_cv_repeats=inner_cv_repeats,max_features_cap=max_features_cap,min_features=min_features,corr_threshold=corr_threshold,n_trials=n_trials,overfit_penalty_weight=overfit_penalty_weight,optimize_metric=optimize_metric,random_state=random_state,inner_split_strategy=inner_split_strategy,inner_groups=inner_groups,y_stratify_bins=y_stratify_bins)
+            result = (fold_results[global_fold - 1] if fold_results is not None else _fit_outer(model_name, global_fold, train_index, test_index))
             pred=result['pred_test']; y_test=y.iloc[test_index]; metrics=result['metrics']
             for local_i,(true,predicted) in enumerate(zip(y_test.values,pred)):
                 original=int(test_index[local_i]); prow={"Model":model_name,"Fold":global_fold,"Sample_ID":original,"True":true,"Predicted":predicted,"Residual":true-predicted}
@@ -1059,7 +887,7 @@ def run_nested_regression(
         mean_predictions=member_predictions.mean(axis=1)
         std_predictions=member_predictions.std(axis=1)
         for sample_id,(true_value,predicted_value,prediction_std) in enumerate(zip(y,mean_predictions,std_predictions)):
-            row={'Model':model_name,'Sample_ID':sample_id,'True':true_value,'Predicted':predicted_value,'Residual':true_value-predicted_value,'Prediction_STD':prediction_std}
+            row={'Model':model_name,'Sample_ID':sample_id,'True':true_value,'Predicted':predicted_value,'Residual':true_value-predicted_value,'Prediction_STD':prediction_std,'CI95_Lower':predicted_value-1.96*prediction_std,'CI95_Upper':predicted_value+1.96*prediction_std}
             for c in metadata.columns:
                 row[c]=metadata.iloc[sample_id][c]
             full_rows.append(row)
@@ -1068,14 +896,7 @@ def run_nested_regression(
 
 
 ### 7. Result aggregation and Excel export ###
-def _build_result_tables(
-    models_dict,
-    summary_results,
-    all_predictions,
-    all_params,
-    all_selected_features,
-    optimize_metric,
-) -> dict[str, Any]:
+def _build_result_tables( models_dict, summary_results, all_predictions, all_params, all_selected_features, optimize_metric, ) -> dict[str, Any]:
     optimize_metric = str(optimize_metric).lower()
     nested_sort_columns = {
         "r2": ("R2_all_repeated_oof_predictions", False),
@@ -1085,21 +906,19 @@ def _build_result_tables(
     if optimize_metric not in nested_sort_columns:
         raise ValueError("optimize_metric must be one of: r2, rmse, mae.")
     nested_sort_column, nested_ascending = nested_sort_columns[optimize_metric]
-    df_summary_nested = pd.DataFrame(summary_results).sort_values(
-        by=nested_sort_column, ascending=nested_ascending
-    )
+    df_summary_nested = pd.DataFrame(summary_results).sort_values( by=nested_sort_column, ascending=nested_ascending )
     df_summary_nested.insert(1, "Model_selection_metric", optimize_metric)
     df_predictions_nested = pd.DataFrame(all_predictions)
     # Repeated CV gives several OOF predictions per sample. Average them here
     # so each sample contributes once to the principal summary metrics.
     df_predictions_mean = (
         df_predictions_nested.groupby(["Model", "Sample_ID"])
-        .agg({"True": "mean", "Predicted": "mean"})
+        .agg(**{"True":("True","mean"),"Predicted":("Predicted","mean"),"Prediction_STD":("Predicted",lambda x: np.std(x,ddof=0))})
         .reset_index()
     )
-    df_predictions_mean["Residual"] = (
-        df_predictions_mean["True"] - df_predictions_mean["Predicted"]
-    )
+    df_predictions_mean["Residual"] = df_predictions_mean["True"] - df_predictions_mean["Predicted"]
+    df_predictions_mean["CI95_Lower"] = df_predictions_mean["Predicted"] - 1.96 * df_predictions_mean["Prediction_STD"]
+    df_predictions_mean["CI95_Upper"] = df_predictions_mean["Predicted"] + 1.96 * df_predictions_mean["Prediction_STD"]
 
     summary_mean_rows = []
     for model_name in df_predictions_mean["Model"].unique():
@@ -1124,41 +943,19 @@ def _build_result_tables(
         "mae": ("MAE_mean_oof_prediction_per_sample", True),
     }
     mean_sort_column, mean_ascending = mean_sort_columns[optimize_metric]
-    df_summary_mean = pd.DataFrame(summary_mean_rows).sort_values(
-        by=mean_sort_column, ascending=mean_ascending
-    )
+    df_summary_mean = pd.DataFrame(summary_mean_rows).sort_values( by=mean_sort_column, ascending=mean_ascending )
     df_summary_mean.insert(1, "Model_selection_metric", optimize_metric)
 
-    df_summary_mean["r2_mean_prediction"] = df_summary_mean[
-        "R2_mean_oof_prediction_per_sample"
-    ]
-    df_summary_mean["rmse_mean_prediction"] = df_summary_mean[
-        "RMSE_mean_oof_prediction_per_sample"
-    ]
-    df_summary_mean["mae_mean_prediction"] = df_summary_mean[
-        "MAE_mean_oof_prediction_per_sample"
-    ]
-    df_summary_nested["R2_all_predictions"] = df_summary_nested[
-        "R2_all_repeated_oof_predictions"
-    ]
-    df_summary_nested["RMSE_all_predictions"] = df_summary_nested[
-        "RMSE_all_repeated_oof_predictions"
-    ]
-    df_summary_nested["MAE_all_predictions"] = df_summary_nested[
-        "MAE_all_repeated_oof_predictions"
-    ]
+    df_summary_mean["r2_mean_prediction"] = df_summary_mean[ "R2_mean_oof_prediction_per_sample" ]
+    df_summary_mean["rmse_mean_prediction"] = df_summary_mean[ "RMSE_mean_oof_prediction_per_sample" ]
+    df_summary_mean["mae_mean_prediction"] = df_summary_mean[ "MAE_mean_oof_prediction_per_sample" ]
+    df_summary_nested["R2_all_predictions"] = df_summary_nested[ "R2_all_repeated_oof_predictions" ]
+    df_summary_nested["RMSE_all_predictions"] = df_summary_nested[ "RMSE_all_repeated_oof_predictions" ]
+    df_summary_nested["MAE_all_predictions"] = df_summary_nested[ "MAE_all_repeated_oof_predictions" ]
 
     df_params = pd.DataFrame(all_params)
-    df_train_mean = (
-        df_params.groupby("Model")[["r2_train", "rmse_train", "mae_train"]]
-        .mean()
-        .reset_index()
-    )
-    df_test_mean = (
-        df_params.groupby("Model")[["r2_test", "rmse_test", "mae_test"]]
-        .mean()
-        .reset_index()
-    )
+    df_train_mean = ( df_params.groupby("Model")[["r2_train", "rmse_train", "mae_train"]] .mean() .reset_index() )
+    df_test_mean = ( df_params.groupby("Model")[["r2_test", "rmse_test", "mae_test"]] .mean() .reset_index() )
 
     df_selected_features = pd.DataFrame(all_selected_features)
     n_outer_folds = df_params["Fold"].nunique()
@@ -1167,15 +964,8 @@ def _build_result_tables(
         df_feature_frequency = pd.DataFrame()
         df_feature_frequency_by_selector = pd.DataFrame()
     else:
-        df_feature_frequency = (
-            df_selected_features.groupby(["Model", "Feature"])
-            .size()
-            .reset_index(name="Count")
-            .sort_values(["Model", "Count"], ascending=[True, False])
-        )
-        df_feature_frequency["Selection_Frequency"] = (
-            df_feature_frequency["Count"] / n_outer_folds
-        )
+        df_feature_frequency = ( df_selected_features.groupby(["Model", "Feature"]) .size() .reset_index(name="Count") .sort_values(["Model", "Count"], ascending=[True, False]) )
+        df_feature_frequency["Selection_Frequency"] = ( df_feature_frequency["Count"] / n_outer_folds )
 
         df_feature_frequency_by_selector = (
             df_selected_features.groupby(
@@ -1188,9 +978,7 @@ def _build_result_tables(
                 ascending=[True, True, False],
             )
         )
-        df_feature_frequency_by_selector["Selection_Frequency"] = (
-            df_feature_frequency_by_selector["Count"] / n_outer_folds
-        )
+        df_feature_frequency_by_selector["Selection_Frequency"] = ( df_feature_frequency_by_selector["Count"] / n_outer_folds )
 
     df_selector_frequency = (
         df_params.groupby(["Model", "Feature_Selection_Method"])
@@ -1198,9 +986,7 @@ def _build_result_tables(
         .reset_index(name="Count")
         .sort_values(["Model", "Count"], ascending=[True, False])
     )
-    df_selector_frequency["Selection_Method_Frequency"] = (
-        df_selector_frequency["Count"] / n_outer_folds
-    )
+    df_selector_frequency["Selection_Method_Frequency"] = ( df_selector_frequency["Count"] / n_outer_folds )
 
     # Representative features are ranked by how frequently they were selected
     # across outer folds. They are intended for interpretation and plotting, not
@@ -1251,12 +1037,7 @@ def _configuration_to_dataframe(configuration: dict[str, Any] | None) -> pd.Data
     return pd.DataFrame(rows)
 
 
-def export_workflow_results(
-    results: dict[str, Any],
-    output_file: str | Path,
-    save_excel: bool = True,
-    configuration: dict[str, Any] | None = None,
-) -> Path | None:
+def export_workflow_results( results: dict[str, Any], output_file: str | Path, save_excel: bool = True, configuration: dict[str, Any] | None = None, ) -> Path | None:
     """Export the complete workflow output to one Excel workbook."""
     if not save_excel:
         return None
@@ -1266,11 +1047,7 @@ def export_workflow_results(
 
     with pd.ExcelWriter(output_file) as writer:
         if configuration is not None:
-            _configuration_to_dataframe(configuration).to_excel(
-                writer,
-                sheet_name="Configuration",
-                index=False,
-            )
+            _configuration_to_dataframe(configuration).to_excel( writer, sheet_name="Configuration", index=False, )
 
         sheet_map = {
             "summary_nested": "Summary_all_predictions",
@@ -1298,23 +1075,14 @@ def export_workflow_results(
     return output_file
 
 ### 8. General plotting utilities ###
-def _finish_figure(
-    output_path: str | Path | None,
-    save_figures: bool,
-    show_figures: bool,
-    plot_settings: dict[str, Any] | None = None,
-):
+def _finish_figure( output_path: str | Path | None, save_figures: bool, show_figures: bool, plot_settings: dict[str, Any] | None = None, ):
     """Save, display and close the current Matplotlib figure."""
     settings = _resolve_plot_settings(plot_settings)
 
     if save_figures and output_path is not None:
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(
-            output_path,
-            dpi=settings["dpi"],
-            bbox_inches="tight",
-        )
+        plt.savefig( output_path, dpi=settings["dpi"], bbox_inches="tight", )
 
     if show_figures:
         plt.show()
@@ -1351,9 +1119,7 @@ DEFAULT_PLOT_SETTINGS = {
     "point_edge_width": 1.0,
 }
 
-def _resolve_plot_settings(
-    plot_settings: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+def _resolve_plot_settings( plot_settings: dict[str, Any] | None = None, ) -> dict[str, Any]:
     settings = DEFAULT_PLOT_SETTINGS.copy()
     if plot_settings:
         unknown = sorted(set(plot_settings) - set(settings))
@@ -1370,13 +1136,7 @@ def _style_axes(settings: dict[str, Any]):
         plt.grid(alpha=settings["grid_alpha"])
 
 
-def _annotate_bar_values(
-    bars,
-    values=None,
-    horizontal: bool = False,
-    fmt: str = ".1f",
-    fontsize: float | None = None,
-):
+def _annotate_bar_values( bars, values=None, horizontal: bool = False, fmt: str = ".1f", fontsize: float | None = None, ):
     bars = list(bars)
     if values is None:
         values = [bar.get_width() if horizontal else bar.get_height() for bar in bars]
@@ -1392,14 +1152,7 @@ def _annotate_bar_values(
             x_position = bar.get_x() + bar.get_width() / 2
             y_position = bar.get_y() + bar.get_height() / 2
 
-        plt.text(
-            x_position,
-            y_position,
-            format(float(value), fmt),
-            ha="center",
-            va="center",
-            fontsize=fontsize,
-        )
+        plt.text( x_position, y_position, format(float(value), fmt), ha="center", va="center", fontsize=fontsize, )
 
 
 
@@ -1417,25 +1170,10 @@ def plot_correlation_heatmap(
     settings = _resolve_plot_settings(plot_settings)
     plt.figure(figsize=figure_size)
     matrix = X.corr()
-    image = plt.imshow(
-        matrix,
-        aspect="auto",
-        vmin=-1,
-        vmax=1,
-        cmap="coolwarm",
-    )
+    image = plt.imshow( matrix, aspect="auto", vmin=-1, vmax=1, cmap="coolwarm", )
     plt.colorbar(image, label="Pearson correlation")
-    plt.xticks(
-        range(len(matrix.columns)),
-        matrix.columns,
-        rotation=90,
-        fontsize=max(4, settings["tick_size"] - 2),
-    )
-    plt.yticks(
-        range(len(matrix.index)),
-        matrix.index,
-        fontsize=max(4, settings["tick_size"] - 2),
-    )
+    plt.xticks( range(len(matrix.columns)), matrix.columns, rotation=90, fontsize=max(4, settings["tick_size"] - 2), )
+    plt.yticks( range(len(matrix.index)), matrix.index, fontsize=max(4, settings["tick_size"] - 2), )
     plt.title("Feature correlation matrix", fontsize=settings["title_size"])
     plt.tight_layout()
 
@@ -1465,19 +1203,9 @@ def plot_target_distribution(
         raise ValueError("No finite target values are available for plotting.")
 
     plt.figure(figsize=settings["bar_figure_size"])
-    plt.hist(
-        y_values,
-        bins=bins,
-        color=settings["bar_color"],
-        edgecolor=settings["bar_edge_color"],
-        linewidth=settings["bar_edge_width"],
-        density=density,
-    )
+    plt.hist( y_values, bins=bins, color=settings["bar_color"], edgecolor=settings["bar_edge_color"], linewidth=settings["bar_edge_width"], density=density, )
     plt.xlabel(target_label, fontsize=settings["label_size"])
-    plt.ylabel(
-        "Density" if density else "Frequency",
-        fontsize=settings["label_size"],
-    )
+    plt.ylabel( "Density" if density else "Frequency", fontsize=settings["label_size"], )
     _style_axes(settings)
     plt.tight_layout()
 
@@ -1510,22 +1238,14 @@ def plot_target_split_distribution(
     """
     settings = _resolve_plot_settings(plot_settings)
     y_full = np.asarray(list(y), dtype=float)
-    selected_fold = split_assignments[
-        split_assignments["Fold"] == int(fold)
-    ].copy()
+    selected_fold = split_assignments[ split_assignments["Fold"] == int(fold) ].copy()
 
     if selected_fold.empty:
         available = sorted(split_assignments["Fold"].unique().tolist())
-        raise ValueError(
-            f"Fold {fold} was not found. Available outer folds: {available}"
-        )
+        raise ValueError( f"Fold {fold} was not found. Available outer folds: {available}" )
 
-    y_training = selected_fold.loc[
-        selected_fold["Set"] == "Training", "Target"
-    ].to_numpy(dtype=float)
-    y_validation = selected_fold.loc[
-        selected_fold["Set"] == "Validation", "Target"
-    ].to_numpy(dtype=float)
+    y_training = selected_fold.loc[ selected_fold["Set"] == "Training", "Target" ].to_numpy(dtype=float)
+    y_validation = selected_fold.loc[ selected_fold["Set"] == "Validation", "Target" ].to_numpy(dtype=float)
 
     values_for_bins = [y_full, y_training, y_validation]
     y_external = None
@@ -1587,22 +1307,14 @@ def plot_target_split_distribution(
         )
 
     plt.xlabel(target_label, fontsize=settings["label_size"])
-    plt.ylabel(
-        "Density" if density else "Frequency",
-        fontsize=settings["label_size"],
-    )
-    plt.title(
-        f"Target distribution across dataset subsets: outer fold {fold}",
-        fontsize=settings["title_size"],
-    )
+    plt.ylabel( "Density" if density else "Frequency", fontsize=settings["label_size"], )
+    plt.title( f"Target distribution across dataset subsets: outer fold {fold}", fontsize=settings["title_size"], )
     plt.legend(loc="upper right", fontsize=settings["legend_size"])
     _style_axes(settings)
     plt.tight_layout()
 
     extension = settings["file_format"]
-    path = Path(results_dir) / (
-        f"target_split_distribution_fold_{fold}_{output_prefix}.{extension}"
-    )
+    path = Path(results_dir) / ( f"target_split_distribution_fold_{fold}_{output_prefix}.{extension}" )
     _finish_figure(path, save_figures, show_figures, settings)
     return path
 
@@ -1618,85 +1330,21 @@ def plot_oof_parity(
     plot_settings: dict[str, Any] | None = None,
 ):
     """Plot averaged out-of-fold predictions for each model family."""
-    settings = _resolve_plot_settings(plot_settings)
-    paths = []
-
+    settings=_resolve_plot_settings(plot_settings); paths=[]
     for model_name in results["predictions_mean"]["Model"].unique():
-        df_model = results["predictions_mean"][
-            results["predictions_mean"]["Model"] == model_name
-        ]
-        summary = results["summary_mean"][
-            results["summary_mean"]["Model"] == model_name
-        ].iloc[0]
-
-        plt.figure(figsize=settings["parity_figure_size"])
-        plt.scatter(
-            df_model["True"],
-            df_model["Predicted"],
-            s=settings["point_size"],
-            alpha=settings["point_alpha"],
-            color=settings["oof_color"],
-            edgecolor=settings["point_edge_color"],
-            linewidth=settings["point_edge_width"],
-            label="Out of fold",
-        )
-
-        minimum = min(df_model["True"].min(), df_model["Predicted"].min())
-        maximum = max(df_model["True"].max(), df_model["Predicted"].max())
-        plt.plot(
-            [minimum, maximum],
-            [minimum, maximum],
-            linewidth=settings["line_width"],
-            color=settings["reference_line_color"],
-        )
-
-        plt.text(
-            0.05,
-            0.95,
-            f"OOF R² = {summary['R2_mean_oof_prediction_per_sample']:.3f}\n"
-            f"OOF MAE = {summary['MAE_mean_oof_prediction_per_sample']:.3f}\n"
-            f"OOF RMSE = {summary['RMSE_mean_oof_prediction_per_sample']:.3f}",
-            transform=plt.gca().transAxes,
-            va="top",
-            fontsize=settings["legend_size"],
-        )
-
-        plt.xlabel(
-            f"Experimental {target_label}",
-            fontsize=settings["label_size"],
-        )
-        plt.ylabel(
-            f"Predicted {target_label}",
-            fontsize=settings["label_size"],
-        )
-        plt.title(
-            f"Ensemble {model_name}",
-            fontsize=settings["title_size"],
-        )
-        plt.legend(loc="lower right", fontsize=settings["legend_size"])
-
-        if axis_limits is not None:
-            plt.xlim(*axis_limits)
-            plt.ylim(*axis_limits)
-
-        if settings["equal_aspect"]:
-            plt.gca().set_aspect("equal", adjustable="box")
-
-        _style_axes(settings)
-        plt.tight_layout()
-
-        extension = settings["file_format"]
-        path = Path(results_dir) / (
-            f"oof_parity_{model_name}_{output_prefix}.{extension}"
-        )
-        _finish_figure(
-            path,
-            save_figures,
-            show_figures,
-            plot_settings=settings,
-        )
-        paths.append(path)
-
+        df_model=results["predictions_mean"][results["predictions_mean"]["Model"]==model_name].copy().sort_values("True"); summary=results["summary_mean"][results["summary_mean"]["Model"]==model_name].iloc[0]
+        x=df_model["True"].to_numpy(float); pred=df_model["Predicted"].to_numpy(float); sd=df_model["Prediction_STD"].to_numpy(float)
+        plt.figure(figsize=settings["parity_figure_size"]); plt.errorbar(x,pred,yerr=sd,fmt="none",ecolor="#666666",elinewidth=1.5,alpha=0.95,capsize=2,zorder=2,label="±1 SD")
+        if len(x)>=3 and np.ptp(x)>0:
+            slope,intercept=np.polyfit(x,pred,1); x_fit=np.linspace(x.min(),x.max(),200); y_fit=intercept+slope*x_fit; residuals=pred-(intercept+slope*x); dof=len(x)-2; s_err=np.sqrt(np.sum(residuals**2)/dof); sxx=np.sum((x-x.mean())**2); se_fit=s_err*np.sqrt(1/len(x)+(x_fit-x.mean())**2/sxx); delta=t.ppf(0.975,dof)*se_fit
+            plt.fill_between(x_fit,y_fit-delta,y_fit+delta,color=settings["oof_color"],alpha=0.18,label="95% confidence interval",zorder=1); plt.plot(x_fit,y_fit,color=settings["oof_color"],linewidth=settings["line_width"],zorder=2,label="Regression fit")
+        plt.scatter(x,pred,s=settings["point_size"],alpha=settings["point_alpha"],color=settings["oof_color"],edgecolor=settings["point_edge_color"],linewidth=settings["point_edge_width"],label="Out of fold",zorder=3)
+        minimum=min(x.min(),pred.min()); maximum=max(x.max(),pred.max()); plt.plot([minimum,maximum],[minimum,maximum],linewidth=settings["line_width"],color=settings["reference_line_color"])
+        plt.text(0.05,0.95,f"OOF R² = {summary['R2_mean_oof_prediction_per_sample']:.3f}\nOOF MAE = {summary['MAE_mean_oof_prediction_per_sample']:.3f}\nOOF RMSE = {summary['RMSE_mean_oof_prediction_per_sample']:.3f}",transform=plt.gca().transAxes,va="top",fontsize=settings["legend_size"]); plt.xlabel(f"Experimental {target_label}",fontsize=settings["label_size"]); plt.ylabel(f"Predicted {target_label}",fontsize=settings["label_size"]); plt.title(f"Ensemble {model_name}",fontsize=settings["title_size"]); plt.legend(loc="upper center",bbox_to_anchor=(0.5,-0.20),ncol=2,fontsize=settings["legend_size"],frameon=True)
+        plt.subplots_adjust(bottom=0.28)
+        if axis_limits is not None: plt.xlim(*axis_limits); plt.ylim(*axis_limits)
+        if settings["equal_aspect"]: plt.gca().set_aspect("equal",adjustable="box")
+        _style_axes(settings); plt.tight_layout(); extension=settings["file_format"]; path=Path(results_dir)/f"oof_parity_{model_name}_{output_prefix}.{extension}"; _finish_figure(path,save_figures,show_figures,plot_settings=settings); paths.append(path)
     return paths
 
 def plot_model_metric_comparison(
@@ -1710,57 +1358,29 @@ def plot_model_metric_comparison(
 ):
     """Compare model families using averaged OOF R², MAE or RMSE."""
     settings = _resolve_plot_settings(plot_settings)
-    metric_key_map = {
-        "R2": "R2_mean_oof_prediction_per_sample",
-        "MAE": "MAE_mean_oof_prediction_per_sample",
-        "RMSE": "RMSE_mean_oof_prediction_per_sample",
-    }
+    metric_key_map = { "R2": "R2_mean_oof_prediction_per_sample", "MAE": "MAE_mean_oof_prediction_per_sample", "RMSE": "RMSE_mean_oof_prediction_per_sample", }
 
     metric = metric.upper()
     if metric not in metric_key_map:
         raise ValueError("metric must be one of: R2, MAE, RMSE.")
 
     metric_column = metric_key_map[metric]
-    summary = results["summary_mean"].sort_values(
-        metric_column,
-        ascending=(metric != "R2"),
-    )
+    summary = results["summary_mean"].sort_values( metric_column, ascending=(metric != "R2"), )
 
     plt.figure(figsize=settings["bar_figure_size"])
-    bars = plt.bar(
-        summary["Model"],
-        summary[metric_column],
-        color=settings["bar_color"],
-        edgecolor=settings["bar_edge_color"],
-        linewidth=settings["bar_edge_width"],
-    )
+    bars = plt.bar( summary["Model"], summary[metric_column], color=settings["bar_color"], edgecolor=settings["bar_edge_color"], linewidth=settings["bar_edge_width"], )
     plt.ylabel(f"OOF {metric}", fontsize=settings["label_size"])
     plt.xlabel("Model", fontsize=settings["label_size"])
-    plt.title(
-        f"Model comparison: OOF {metric}",
-        fontsize=settings["title_size"],
-    )
+    plt.title( f"Model comparison: OOF {metric}", fontsize=settings["title_size"], )
     plt.xticks(rotation=45, ha="right", fontsize=settings["tick_size"])
 
-    _annotate_bar_values(
-        bars,
-        summary[metric_column],
-        fmt=".1f",
-        fontsize=settings["tick_size"],
-    )
+    _annotate_bar_values( bars, summary[metric_column], fmt=".1f", fontsize=settings["tick_size"], )
 
     _style_axes(settings)
     plt.tight_layout()
     extension = settings["file_format"]
-    path = Path(results_dir) / (
-        f"model_comparison_{metric.lower()}_{output_prefix}.{extension}"
-    )
-    _finish_figure(
-        path,
-        save_figures,
-        show_figures,
-        plot_settings=settings,
-    )
+    path = Path(results_dir) / ( f"model_comparison_{metric.lower()}_{output_prefix}.{extension}" )
+    _finish_figure( path, save_figures, show_figures, plot_settings=settings, )
     return path
 
 def plot_overfitting_gap(
@@ -1775,11 +1395,7 @@ def plot_overfitting_gap(
     """Plot the mean outer-fold training-to-test performance gap."""
     settings = _resolve_plot_settings(plot_settings)
     metric = metric.lower()
-    metric_columns = {
-        "r2": ("r2_train", "r2_test", "R²"),
-        "rmse": ("rmse_train", "rmse_test", "RMSE"),
-        "mae": ("mae_train", "mae_test", "MAE"),
-    }
+    metric_columns = { "r2": ("r2_train", "r2_test", "R²"), "rmse": ("rmse_train", "rmse_test", "RMSE"), "mae": ("mae_train", "mae_test", "MAE"), }
     if metric not in metric_columns:
         raise ValueError("metric must be one of: r2, rmse, mae.")
     train_column, test_column, metric_label = metric_columns[metric]
@@ -1792,11 +1408,7 @@ def plot_overfitting_gap(
         comparison["Metric_gap"] = comparison[test_column] - comparison[train_column]
     comparison = comparison.sort_values("Metric_gap", ascending=False)
     plt.figure(figsize=settings["bar_figure_size"])
-    bars = plt.bar(
-        comparison["Model"], comparison["Metric_gap"],
-        color=settings["bar_color"], edgecolor=settings["bar_edge_color"],
-        linewidth=settings["bar_edge_width"],
-    )
+    bars = plt.bar( comparison["Model"], comparison["Metric_gap"], color=settings["bar_color"], edgecolor=settings["bar_edge_color"], linewidth=settings["bar_edge_width"], )
     plt.axhline(0, linewidth=settings["line_width"], color=settings["reference_line_color"])
     plt.ylabel(f"Training-to-test degradation in {metric_label}", fontsize=settings["label_size"])
     plt.xlabel("Model", fontsize=settings["label_size"])
@@ -1824,25 +1436,12 @@ def plot_selector_frequency(
     if dataframe.empty:
         return None
 
-    pivot = dataframe.pivot(
-        index="Model",
-        columns="Feature_Selection_Method",
-        values="Selection_Method_Frequency",
-    ).fillna(0)
+    pivot = dataframe.pivot( index="Model", columns="Feature_Selection_Method", values="Selection_Method_Frequency", ).fillna(0)
 
-    axis = pivot.plot(
-        kind="bar",
-        figsize=settings["bar_figure_size"],
-        color=None,
-        edgecolor=settings["bar_edge_color"],
-        linewidth=settings["bar_edge_width"],
-    )
+    axis = pivot.plot( kind="bar", figsize=settings["bar_figure_size"], color=None, edgecolor=settings["bar_edge_color"], linewidth=settings["bar_edge_width"], )
     axis.set_ylabel("Selection frequency", fontsize=settings["label_size"])
     axis.set_xlabel("Model", fontsize=settings["label_size"])
-    axis.set_title(
-        "Feature-selection method frequency",
-        fontsize=settings["title_size"],
-    )
+    axis.set_title( "Feature-selection method frequency", fontsize=settings["title_size"], )
     axis.legend(title="Selector", loc="upper right", fontsize=settings["legend_size"])
 
     plt.xticks(rotation=45, ha="right", fontsize=settings["tick_size"])
@@ -1871,11 +1470,7 @@ def plot_feature_frequency(
 
     paths = []
     for model_name in dataframe["Model"].unique():
-        subset = (
-            dataframe[dataframe["Model"] == model_name]
-            .nlargest(top_n, "Selection_Frequency")
-            .sort_values("Selection_Frequency")
-        )
+        subset = ( dataframe[dataframe["Model"] == model_name] .nlargest(top_n, "Selection_Frequency") .sort_values("Selection_Frequency") )
 
         figure_height = max(3.0, 0.28 * len(subset))
         plt.figure(figsize=(settings["bar_figure_size"][0], figure_height))
@@ -1888,25 +1483,14 @@ def plot_feature_frequency(
         )
         plt.xlabel("Selection frequency", fontsize=settings["label_size"])
         plt.ylabel("Feature", fontsize=settings["label_size"])
-        plt.title(
-            f"Top selected features: {model_name}",
-            fontsize=settings["title_size"],
-        )
+        plt.title( f"Top selected features: {model_name}", fontsize=settings["title_size"], )
         plt.xlim(0, 1)
-        _annotate_bar_values(
-            bars,
-            subset["Selection_Frequency"],
-            horizontal=True,
-            fmt=".2f",
-            fontsize=settings["tick_size"],
-        )
+        _annotate_bar_values( bars, subset["Selection_Frequency"], horizontal=True, fmt=".2f", fontsize=settings["tick_size"], )
         _style_axes(settings)
         plt.tight_layout()
 
         extension = settings["file_format"]
-        path = Path(results_dir) / (
-            f"feature_frequency_{model_name}_{output_prefix}.{extension}"
-        )
+        path = Path(results_dir) / ( f"feature_frequency_{model_name}_{output_prefix}.{extension}" )
         _finish_figure(path, save_figures, show_figures, settings)
         paths.append(path)
 
@@ -1926,12 +1510,8 @@ def plot_model_prediction_comparison(
     settings = _resolve_plot_settings(plot_settings)
     predictions = results["predictions_mean"]
 
-    x_values = predictions[predictions["Model"] == model_x][
-        ["Sample_ID", "Predicted"]
-    ].rename(columns={"Predicted": f"Predicted_{model_x}"})
-    y_values = predictions[predictions["Model"] == model_y][
-        ["Sample_ID", "Predicted"]
-    ].rename(columns={"Predicted": f"Predicted_{model_y}"})
+    x_values = predictions[predictions["Model"] == model_x][ ["Sample_ID", "Predicted"] ].rename(columns={"Predicted": f"Predicted_{model_x}"})
+    y_values = predictions[predictions["Model"] == model_y][ ["Sample_ID", "Predicted"] ].rename(columns={"Predicted": f"Predicted_{model_y}"})
 
     merged = x_values.merge(y_values, on="Sample_ID", how="inner")
     if merged.empty:
@@ -1952,12 +1532,7 @@ def plot_model_prediction_comparison(
     )
     lower = min(merged[x_column].min(), merged[y_column].min())
     upper = max(merged[x_column].max(), merged[y_column].max())
-    plt.plot(
-        [lower, upper],
-        [lower, upper],
-        linewidth=settings["line_width"],
-        color=settings["reference_line_color"],
-    )
+    plt.plot( [lower, upper], [lower, upper], linewidth=settings["line_width"], color=settings["reference_line_color"], )
     plt.xlabel(f"{model_x} OOF prediction", fontsize=settings["label_size"])
     plt.ylabel(f"{model_y} OOF prediction", fontsize=settings["label_size"])
     plt.title(f"{model_x} vs {model_y}", fontsize=settings["title_size"])
@@ -1967,9 +1542,7 @@ def plot_model_prediction_comparison(
     plt.tight_layout()
 
     extension = settings["file_format"]
-    path = Path(results_dir) / (
-        f"model_prediction_comparison_{model_x}_vs_{model_y}_{output_prefix}.{extension}"
-    )
+    path = Path(results_dir) / ( f"model_prediction_comparison_{model_x}_vs_{model_y}_{output_prefix}.{extension}" )
     _finish_figure(path, save_figures, show_figures, settings)
     return path
 
@@ -2000,10 +1573,7 @@ def evaluate_external_dataset(
     output = df_external.reset_index(drop=True).copy()
     metrics_rows = []
 
-    has_target = (
-        target_column in output.columns
-        and output[target_column].notna().all()
-    )
+    has_target = ( target_column in output.columns and output[target_column].notna().all() )
     if has_target:
         y_external = pd.to_numeric(output[target_column], errors="raise")
 
@@ -2016,7 +1586,7 @@ def evaluate_external_dataset(
         output[f"Predicted_{model_name}"] = prediction
 
         if include_prediction_std:
-            output[f"Prediction_STD_{model_name}"] = ensemble.predict_std(X_external)
+            prediction_std=ensemble.predict_std(X_external); output[f"Prediction_STD_{model_name}"]=prediction_std; output[f"CI95_Lower_{model_name}"]=prediction-1.96*prediction_std; output[f"CI95_Upper_{model_name}"]=prediction+1.96*prediction_std
 
         if has_target:
             metrics_rows.append(
@@ -2032,21 +1602,14 @@ def evaluate_external_dataset(
     return output, pd.DataFrame(metrics_rows)
 
 
-def combine_training_and_external_predictions(
-    results: dict[str, Any],
-    external_results: pd.DataFrame,
-    target_column: str,
-    model_names: list[str] | None = None,
-) -> pd.DataFrame:
+def combine_training_and_external_predictions( results: dict[str, Any], external_results: pd.DataFrame, target_column: str, model_names: list[str] | None = None, ) -> pd.DataFrame:
     """Combine mean OOF training predictions and external predictions."""
     model_names = model_names or list(results["models_dict"])
     combined_rows = []
 
     training_predictions = results["predictions_mean"]
     for model_name in model_names:
-        training_model = training_predictions[
-            training_predictions["Model"] == model_name
-        ].copy()
+        training_model = training_predictions[ training_predictions["Model"] == model_name ].copy()
 
         for _, row in training_model.iterrows():
             combined_rows.append(
@@ -2057,7 +1620,9 @@ def combine_training_and_external_predictions(
                     "True": row["True"],
                     "Predicted": row["Predicted"],
                     "Residual": row["Residual"],
-                    "Prediction_STD": np.nan,
+                    "Prediction_STD": row["Prediction_STD"],
+                    "CI95_Lower": row["CI95_Lower"],
+                    "CI95_Upper": row["CI95_Upper"],
                 }
             )
 
@@ -2065,11 +1630,7 @@ def combine_training_and_external_predictions(
         std_column = f"Prediction_STD_{model_name}"
 
         for external_index, external_row in external_results.iterrows():
-            true_value = (
-                external_row[target_column]
-                if target_column in external_results.columns
-                else np.nan
-            )
+            true_value = ( external_row[target_column] if target_column in external_results.columns else np.nan )
             predicted_value = external_row[prediction_column]
             combined_rows.append(
                 {
@@ -2083,11 +1644,9 @@ def combine_training_and_external_predictions(
                         if pd.notna(true_value)
                         else np.nan
                     ),
-                    "Prediction_STD": (
-                        external_row[std_column]
-                        if std_column in external_results.columns
-                        else np.nan
-                    ),
+                    "Prediction_STD": (external_row[std_column] if std_column in external_results.columns else np.nan),
+                    "CI95_Lower": (external_row[f"CI95_Lower_{model_name}"] if f"CI95_Lower_{model_name}" in external_results.columns else np.nan),
+                    "CI95_Upper": (external_row[f"CI95_Upper_{model_name}"] if f"CI95_Upper_{model_name}" in external_results.columns else np.nan),
                 }
             )
 
@@ -2109,22 +1668,10 @@ def save_external_results(
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
     with pd.ExcelWriter(output_file) as writer:
-        detailed_results.to_excel(
-            writer,
-            sheet_name="External_predictions",
-            index=False,
-        )
-        metrics.to_excel(
-            writer,
-            sheet_name="External_metrics",
-            index=False,
-        )
+        detailed_results.to_excel( writer, sheet_name="External_predictions", index=False, )
+        metrics.to_excel( writer, sheet_name="External_metrics", index=False, )
         if combined_training_external is not None:
-            combined_training_external.to_excel(
-                writer,
-                sheet_name="Training_OOF_and_external",
-                index=False,
-            )
+            combined_training_external.to_excel( writer, sheet_name="Training_OOF_and_external", index=False, )
 
     return output_file
 
@@ -2144,117 +1691,33 @@ def plot_external_overlay(
     training_reference: str = "full_dataset",
 ):
     """Overlay the external test on the full dataset or validation predictions."""
-    settings = _resolve_plot_settings(plot_settings)
-    if external_metrics.empty:
-        raise ValueError(
-            "External metrics are empty. The external dataset must contain a complete "
-            f"'{target_column}' column to create the overlay."
-        )
-
-    model_names = model_names or list(results["models_dict"])
-    paths = []
-
+    settings=_resolve_plot_settings(plot_settings)
+    if external_metrics.empty: raise ValueError("External metrics are empty. The external dataset must contain a complete " f"'{target_column}' column to create the overlay.")
+    model_names=model_names or list(results["models_dict"]); paths=[]
     for model_name in model_names:
-        reference = training_reference.lower()
-        if reference in {"full", "full_dataset", "training"}:
-            df_cv = results["predictions_full_ensemble"][
-                results["predictions_full_ensemble"]["Model"] == model_name
-            ]
-            training_label = "Full dataset"
-            training_r2 = r2_score(df_cv["True"], df_cv["Predicted"])
-            training_mae = mean_absolute_error(df_cv["True"], df_cv["Predicted"])
-        elif reference in {"validation", "oof"}:
-            df_cv = results["predictions_mean"][
-                results["predictions_mean"]["Model"] == model_name
-            ]
-            training_label = "Validation"
-            summary = results["summary_mean"][
-                results["summary_mean"]["Model"] == model_name
-            ].iloc[0]
-            training_r2 = summary["R2_mean_oof_prediction_per_sample"]
-            training_mae = summary["MAE_mean_oof_prediction_per_sample"]
-        else:
-            raise ValueError(
-                "training_reference must be 'full_dataset' or 'validation'."
-            )
-        metric = external_metrics[
-            external_metrics["Model"] == model_name
-        ].iloc[0]
-        prediction_column = f"Predicted_{model_name}"
-
-        plt.figure(figsize=settings["parity_figure_size"])
-        plt.scatter(
-            df_cv["True"],
-            df_cv["Predicted"],
-            s=settings["point_size"],
-            alpha=settings["point_alpha"],
-            color=settings["oof_color"],
-            edgecolor=settings["point_edge_color"],
-            linewidth=settings["point_edge_width"],
-            label=training_label,
-        )
-        plt.scatter(
-            external_results[target_column],
-            external_results[prediction_column],
-            s=settings["point_size"] * 1.2,
-            alpha=0.9,
-            color=settings["external_color"],
-            edgecolor=settings["reference_line_color"],
-            linewidth=settings["point_edge_width"],
-            label=external_label,
-        )
-
-        all_values = np.concatenate(
-            [
-                df_cv["True"].to_numpy(),
-                df_cv["Predicted"].to_numpy(),
-                external_results[target_column].to_numpy(),
-                external_results[prediction_column].to_numpy(),
-            ]
-        )
-        plt.plot(
-            [all_values.min(), all_values.max()],
-            [all_values.min(), all_values.max()],
-            linewidth=settings["line_width"],
-            color=settings["reference_line_color"],
-        )
-        plt.text(
-            0.05,
-            0.95,
-            f"{training_label} R² = {training_r2:.3f}\n"
-            f"{training_label} MAE = {training_mae:.3f}\n"
-            f"External R² = {metric['R2_external']:.3f}\n"
-            f"External MAE = {metric['MAE_external']:.3f}",
-            transform=plt.gca().transAxes,
-            va="top",
-            fontsize=settings["legend_size"],
-        )
-        plt.xlabel(
-            f"Experimental {target_column}",
-            fontsize=settings["label_size"],
-        )
-        plt.ylabel(
-            f"Predicted {target_column}",
-            fontsize=settings["label_size"],
-        )
-        plt.title(f"Ensemble {model_name}", fontsize=settings["title_size"])
-        plt.legend(loc="lower right", fontsize=settings["legend_size"])
-
-        if axis_limits is not None:
-            plt.xlim(*axis_limits)
-            plt.ylim(*axis_limits)
-        if settings["equal_aspect"]:
-            plt.gca().set_aspect("equal", adjustable="box")
-
-        _style_axes(settings)
-        plt.tight_layout()
-        extension = settings["file_format"]
-        path = Path(results_dir) / (
-            f"external_overlay_{model_name}_{output_prefix}.{extension}"
-        )
-        _finish_figure(path, save_figures, show_figures, settings)
-        paths.append(path)
-
+        reference=training_reference.lower()
+        if reference in {"full","full_dataset","training"}:
+            df_cv=results["predictions_full_ensemble"][results["predictions_full_ensemble"]["Model"]==model_name].copy(); training_label="Full dataset"; training_r2=r2_score(df_cv["True"],df_cv["Predicted"]); training_mae=mean_absolute_error(df_cv["True"],df_cv["Predicted"])
+        elif reference in {"validation","oof"}:
+            df_cv=results["predictions_mean"][results["predictions_mean"]["Model"]==model_name].copy(); training_label="Validation"; summary=results["summary_mean"][results["summary_mean"]["Model"]==model_name].iloc[0]; training_r2=summary["R2_mean_oof_prediction_per_sample"]; training_mae=summary["MAE_mean_oof_prediction_per_sample"]
+        else: raise ValueError("training_reference must be 'full_dataset' or 'validation'.")
+        metric=external_metrics[external_metrics["Model"]==model_name].iloc[0]; prediction_column=f"Predicted_{model_name}"; std_column=f"Prediction_STD_{model_name}"; ext=external_results.copy(); plt.figure(figsize=settings["parity_figure_size"])
+        x=df_cv["True"].to_numpy(float); pred=df_cv["Predicted"].to_numpy(float); sd=df_cv["Prediction_STD"].to_numpy(float) if "Prediction_STD" in df_cv.columns else None
+        if sd is not None: plt.errorbar(x,pred,yerr=sd,fmt="none",ecolor="#666666",elinewidth=1.3,alpha=0.9,capsize=2,zorder=2,label=f"{training_label} ±1 SD")
+        if len(x)>=3 and np.ptp(x)>0:
+            slope,intercept=np.polyfit(x,pred,1); x_fit=np.linspace(x.min(),x.max(),200); y_fit=intercept+slope*x_fit; residuals=pred-(intercept+slope*x); dof=len(x)-2; s_err=np.sqrt(np.sum(residuals**2)/dof); sxx=np.sum((x-x.mean())**2); se_fit=s_err*np.sqrt(1/len(x)+(x_fit-x.mean())**2/sxx); delta=t.ppf(0.975,dof)*se_fit
+            plt.fill_between(x_fit,y_fit-delta,y_fit+delta,color=settings["oof_color"],alpha=0.14,label=f"{training_label} 95% CI",zorder=1); plt.plot(x_fit,y_fit,color=settings["oof_color"],linewidth=settings["line_width"],zorder=2)
+        x_ext=ext[target_column].to_numpy(float); pred_ext=ext[prediction_column].to_numpy(float); sd_ext=ext[std_column].to_numpy(float) if std_column in ext.columns else None
+        if sd_ext is not None: plt.errorbar(x_ext,pred_ext,yerr=sd_ext,fmt="none",ecolor="#666666",elinewidth=1.5,alpha=1.0,capsize=3,zorder=3,label=f"{external_label} ±1 SD")
+        if len(x_ext)>=3 and np.ptp(x_ext)>0:
+            slope_ext,intercept_ext=np.polyfit(x_ext,pred_ext,1); x_fit_ext=np.linspace(x_ext.min(),x_ext.max(),200); y_fit_ext=intercept_ext+slope_ext*x_fit_ext; residuals_ext=pred_ext-(intercept_ext+slope_ext*x_ext); dof_ext=len(x_ext)-2; s_err_ext=np.sqrt(np.sum(residuals_ext**2)/dof_ext); sxx_ext=np.sum((x_ext-x_ext.mean())**2); se_fit_ext=s_err_ext*np.sqrt(1/len(x_ext)+(x_fit_ext-x_ext.mean())**2/sxx_ext); delta_ext=t.ppf(0.975,dof_ext)*se_fit_ext
+            plt.fill_between(x_fit_ext,y_fit_ext-delta_ext,y_fit_ext+delta_ext,color=settings["external_color"],alpha=0.18,label=f"{external_label} 95% CI",zorder=1); plt.plot(x_fit_ext,y_fit_ext,color=settings["external_color"],linewidth=settings["line_width"],zorder=2)
+        plt.scatter(x,pred,s=settings["point_size"],alpha=settings["point_alpha"],color=settings["oof_color"],edgecolor=settings["point_edge_color"],linewidth=settings["point_edge_width"],label=training_label,zorder=4); plt.scatter(x_ext,pred_ext,s=settings["point_size"]*1.2,alpha=0.9,color=settings["external_color"],edgecolor=settings["reference_line_color"],linewidth=settings["point_edge_width"],label=external_label,zorder=5)
+        all_values=np.concatenate([x,pred,x_ext,pred_ext]); plt.plot([all_values.min(),all_values.max()],[all_values.min(),all_values.max()],linewidth=settings["line_width"],color=settings["reference_line_color"]); plt.text(0.05,0.95,f"{training_label} R² = {training_r2:.3f}\n{training_label} MAE = {training_mae:.3f}\nExternal R² = {metric['R2_external']:.3f}\nExternal MAE = {metric['MAE_external']:.3f}",transform=plt.gca().transAxes,va="top",fontsize=settings["legend_size"]); plt.xlabel(f"Experimental {target_column}",fontsize=settings["label_size"]); plt.ylabel(f"Predicted {target_column}",fontsize=settings["label_size"]); plt.title(f"Ensemble {model_name}",fontsize=settings["title_size"]); plt.legend(loc="upper center",bbox_to_anchor=(0.5,-0.20),ncol=2,fontsize=settings["legend_size"],frameon=True)
+        plt.subplots_adjust(bottom=0.28)
+        if axis_limits is not None: plt.xlim(*axis_limits); plt.ylim(*axis_limits)
+        if settings["equal_aspect"]: plt.gca().set_aspect("equal",adjustable="box")
+        _style_axes(settings); plt.tight_layout(); extension=settings["file_format"]; path=Path(results_dir)/f"external_overlay_{model_name}_{output_prefix}.{extension}"; _finish_figure(path,save_figures,show_figures,settings); paths.append(path)
     return paths
 
 def plot_virtual_screening_distribution(
@@ -2277,9 +1740,7 @@ def plot_virtual_screening_distribution(
     for model_name in model_names:
         prediction_column = f"Predicted_{model_name}"
         if prediction_column not in screening_results.columns:
-            raise KeyError(
-                f"Column '{prediction_column}' was not found in screening results."
-            )
+            raise KeyError( f"Column '{prediction_column}' was not found in screening results." )
 
         plt.figure(figsize=settings["bar_figure_size"])
         plt.hist(
@@ -2304,18 +1765,13 @@ def plot_virtual_screening_distribution(
         )
         plt.xlabel(target_label, fontsize=settings["label_size"])
         plt.ylabel("Density", fontsize=settings["label_size"])
-        plt.title(
-            f"Virtual-screening distribution: {model_name}",
-            fontsize=settings["title_size"],
-        )
+        plt.title( f"Virtual-screening distribution: {model_name}", fontsize=settings["title_size"], )
         plt.legend(loc="upper right", bbox_to_anchor=(0.98, 0.98), fontsize=settings["legend_size"], framealpha=0.9)
         _style_axes(settings)
         plt.tight_layout()
 
         extension = settings["file_format"]
-        path = Path(results_dir) / (
-            f"virtual_screening_distribution_{model_name}_{output_prefix}.{extension}"
-        )
+        path = Path(results_dir) / ( f"virtual_screening_distribution_{model_name}_{output_prefix}.{extension}" )
         _finish_figure(path, save_figures, show_figures, settings)
         paths.append(path)
 
@@ -2343,10 +1799,7 @@ def compute_ensemble_shap(
     try:
         import shap
     except ImportError as exc:
-        raise ImportError(
-            "SHAP is required for ensemble interpretation. Install it with "
-            "'conda install -c conda-forge shap' or 'pip install shap'."
-        ) from exc
+        raise ImportError( "SHAP is required for ensemble interpretation. Install it with " "'conda install -c conda-forge shap' or 'pip install shap'." ) from exc
 
     if not isinstance(X_background, pd.DataFrame) or not isinstance(X_explain, pd.DataFrame):
         raise TypeError("X_background and X_explain must be pandas DataFrames.")
@@ -2357,37 +1810,21 @@ def compute_ensemble_shap(
 
     X_explain = X_explain.loc[:, X_background.columns].reset_index(drop=True)
     background_size = min(max(1, int(background_size)), len(X_background))
-    background = shap.sample(
-        X_background.reset_index(drop=True),
-        background_size,
-        random_state=random_state,
-    )
+    background = shap.sample( X_background.reset_index(drop=True), background_size, random_state=random_state, )
 
     if max_evals is None:
         max_evals = 2 * X_background.shape[1] + 1
     minimum_evals = 2 * X_background.shape[1] + 1
     if max_evals < minimum_evals:
-        raise ValueError(
-            f"max_evals must be at least {minimum_evals} for "
-            f"{X_background.shape[1]} features."
-        )
+        raise ValueError( f"max_evals must be at least {minimum_evals} for " f"{X_background.shape[1]} features." )
 
     # Explain the ensemble mean directly rather than explaining one arbitrary
     # fold model. Permutation SHAP is model-agnostic and works with mixed model
     # families and fold-specific feature-selection pipelines.
-    explainer = shap.Explainer(
-        ensemble_model.predict,
-        background,
-        algorithm="permutation",
-        feature_names=list(X_background.columns),
-    )
+    explainer = shap.Explainer( ensemble_model.predict, background, algorithm="permutation", feature_names=list(X_background.columns), )
     explanation = explainer(X_explain, max_evals=max_evals)
 
-    labels = (
-        list(dataset_labels)
-        if dataset_labels is not None
-        else ["Train"] * len(X_explain)
-    )
+    labels = ( list(dataset_labels) if dataset_labels is not None else ["Train"] * len(X_explain) )
     ids = list(sample_ids) if sample_ids is not None else list(range(len(X_explain)))
     if len(labels) != len(X_explain) or len(ids) != len(X_explain):
         raise ValueError("dataset_labels and sample_ids must match X_explain length.")
@@ -2405,13 +1842,7 @@ def compute_ensemble_shap(
         "Mean_abs_SHAP": np.abs(explanation.values).mean(axis=0),
     }).sort_values("Mean_abs_SHAP", ascending=False).reset_index(drop=True)
 
-    return {
-        "explanation": explanation,
-        "values": values,
-        "importance": importance,
-        "background": background,
-        "X_explain": X_explain,
-    }
+    return { "explanation": explanation, "values": values, "importance": importance, "background": background, "X_explain": X_explain, }
 
 
 def plot_ensemble_shap(
@@ -2458,11 +1889,7 @@ def plot_ensemble_shap(
     return paths
 
 
-def save_ensemble_shap_results(
-    shap_results: dict[str, dict[str, Any]],
-    output_file: str | Path,
-    save_excel: bool = True,
-) -> Path | None:
+def save_ensemble_shap_results( shap_results: dict[str, dict[str, Any]], output_file: str | Path, save_excel: bool = True, ) -> Path | None:
     """Save ensemble SHAP values and global importance tables to Excel."""
     if not save_excel:
         return None
@@ -2471,25 +1898,13 @@ def save_ensemble_shap_results(
     with pd.ExcelWriter(output_file) as writer:
         for model_name, result in shap_results.items():
             safe_name = str(model_name)[:20]
-            result["values"].to_excel(
-                writer,
-                sheet_name=f"SHAP_{safe_name}"[:31],
-                index=False,
-            )
-            result["importance"].to_excel(
-                writer,
-                sheet_name=f"Importance_{safe_name}"[:31],
-                index=False,
-            )
+            result["values"].to_excel( writer, sheet_name=f"SHAP_{safe_name}"[:31], index=False, )
+            result["importance"].to_excel( writer, sheet_name=f"Importance_{safe_name}"[:31], index=False, )
     return output_file
 
 
 ### 12. Descriptor exploration plots ###
-def compute_feature_target_correlations(
-    X: pd.DataFrame,
-    y: pd.Series,
-    method: str = "pearson",
-) -> pd.DataFrame:
+def compute_feature_target_correlations( X: pd.DataFrame, y: pd.Series, method: str = "pearson", ) -> pd.DataFrame:
     """Compute univariate feature-target correlation, R2 and p-value."""
     method = method.lower()
     if method not in {"pearson", "spearman"}:
@@ -2514,12 +1929,7 @@ def compute_feature_target_correlations(
     return pd.DataFrame(rows).sort_values("Abs_Correlation", ascending=False).reset_index(drop=True)
 
 
-def _resolve_feature_list(
-    X: pd.DataFrame,
-    features: list[str] | None,
-    correlations: pd.DataFrame | None = None,
-    top_n: int | None = None,
-) -> list[str]:
+def _resolve_feature_list( X: pd.DataFrame, features: list[str] | None, correlations: pd.DataFrame | None = None, top_n: int | None = None, ) -> list[str]:
     if features:
         missing = [f for f in features if f not in X.columns]
         if missing:
@@ -2571,24 +1981,12 @@ def plot_feature_target_correlations(
     subset=correlation_table.head(top_n).sort_values("Abs_Correlation")
     height=max(3.0,0.28*len(subset))
     plt.figure(figsize=(settings["bar_figure_size"][0],height))
-    bars = plt.barh(
-        subset["Feature"],
-        subset["Correlation"],
-        color=settings["bar_color"],
-        edgecolor=settings["bar_edge_color"],
-        linewidth=settings["bar_edge_width"],
-    )
+    bars = plt.barh( subset["Feature"], subset["Correlation"], color=settings["bar_color"], edgecolor=settings["bar_edge_color"], linewidth=settings["bar_edge_width"], )
     plt.axvline(0,color=settings["reference_line_color"],linewidth=settings["line_width"])
     plt.xlabel(f"{subset['Method'].iloc[0].capitalize()} correlation with target",fontsize=settings["label_size"])
     plt.ylabel("Feature",fontsize=settings["label_size"])
     plt.title("Univariate feature-target correlations",fontsize=settings["title_size"])
-    _annotate_bar_values(
-        bars,
-        subset["Correlation"],
-        horizontal=True,
-        fmt=".2f",
-        fontsize=settings["tick_size"],
-    )
+    _annotate_bar_values( bars, subset["Correlation"], horizontal=True, fmt=".2f", fontsize=settings["tick_size"], )
     _style_axes(settings); plt.tight_layout()
     path=Path(results_dir)/f"feature_target_correlations_{output_prefix}.{settings['file_format']}"
     _finish_figure(path,save_figures,show_figures,settings)
@@ -2610,11 +2008,7 @@ def plot_feature_target_scatter(
 ) -> list[Path]:
     """Plot one descriptor-versus-target scatter per selected feature."""
     settings = _resolve_plot_settings(plot_settings)
-    selected = (
-        _resolve_feature_list(X, features)
-        if features
-        else correlation_table["Feature"].head(top_n).tolist()
-    )
+    selected = ( _resolve_feature_list(X, features) if features else correlation_table["Feature"].head(top_n).tolist() )
     y_values = np.asarray(y, dtype=float)
     paths = []
 
@@ -2646,11 +2040,7 @@ def plot_feature_target_scatter(
         if len(np.unique(x_plot)) > 1:
             slope, intercept = np.polyfit(x_plot, y_plot, 1)
             x_line = np.linspace(x_plot.min(), x_plot.max(), 100)
-            plt.plot(
-                x_line, slope * x_line + intercept,
-                color=settings["reference_line_color"],
-                linewidth=settings["line_width"],
-            )
+            plt.plot( x_line, slope * x_line + intercept, color=settings["reference_line_color"], linewidth=settings["line_width"], )
 
         plt.text(
             0.05, 0.95,
@@ -2665,10 +2055,7 @@ def plot_feature_target_scatter(
         _style_axes(settings)
         plt.tight_layout()
 
-        path = Path(results_dir) / (
-            f"feature_vs_target_{_safe_filename(feature)}_"
-            f"{output_prefix}.{settings['file_format']}"
-        )
+        path = Path(results_dir) / ( f"feature_vs_target_{_safe_filename(feature)}_" f"{output_prefix}.{settings['file_format']}" )
         _finish_figure(path, save_figures, show_figures, settings)
         paths.append(path)
 
@@ -2679,11 +2066,7 @@ def _safe_filename(value: Any) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value))[:120]
 
 
-def make_feature_pairs(
-    features: list[str],
-    max_pairs: int | None = None,
-    adjacent_only: bool = False,
-) -> list[tuple[str,str]]:
+def make_feature_pairs( features: list[str], max_pairs: int | None = None, adjacent_only: bool = False, ) -> list[tuple[str,str]]:
     if adjacent_only:
         pairs=list(zip(features[:-1],features[1:]))
     else:
@@ -2746,29 +2129,21 @@ def plot_full_ensemble_parity(
     save_figures: bool = True,
     show_figures: bool = True,
     axis_limits: tuple[float,float] | None = None,
-    show_prediction_errorbars: bool = False,
+    show_prediction_errorbars: bool = True,
     plot_settings: dict[str,Any] | None = None,
 ) -> list[Path]:
-    """Plot final fold-ensemble predictions on the full training dataset."""
-    settings=_resolve_plot_settings(plot_settings)
-    dataframe=results["predictions_full_ensemble"]
-    model_names=model_names or dataframe["Model"].unique().tolist()
-    paths = []
+    settings=_resolve_plot_settings(plot_settings); dataframe=results["predictions_full_ensemble"]; model_names=model_names or dataframe["Model"].unique().tolist(); paths=[]
     for model_name in model_names:
-        df=dataframe[dataframe["Model"]==model_name]
-        r2=r2_score(df["True"],df["Predicted"]); rmse=safe_rmse(df["True"],df["Predicted"]); mae=mean_absolute_error(df["True"],df["Predicted"])
+        df=dataframe[dataframe["Model"]==model_name].copy().sort_values("True"); r2=r2_score(df["True"],df["Predicted"]); rmse=safe_rmse(df["True"],df["Predicted"]); mae=mean_absolute_error(df["True"],df["Predicted"]); x=df["True"].to_numpy(float); pred=df["Predicted"].to_numpy(float); sd=df["Prediction_STD"].to_numpy(float)
         plt.figure(figsize=settings["parity_figure_size"])
-        if show_prediction_errorbars:
-            plt.errorbar(df["True"],df["Predicted"],yerr=df["Prediction_STD"],fmt="none",alpha=0.35,linewidth=settings["line_width"],color=settings["point_edge_color"])
-        plt.scatter(df["True"],df["Predicted"],s=settings["point_size"],alpha=settings["point_alpha"],color=settings["oof_color"],edgecolor=settings["bar_edge_color"],linewidth=settings["bar_edge_width"],label="Full-data ensemble")
-        low=min(df["True"].min(),df["Predicted"].min()); high=max(df["True"].max(),df["Predicted"].max())
-        plt.plot([low,high],[low,high],color=settings["reference_line_color"],linewidth=settings["line_width"])
-        plt.text(0.05,0.95,f"In-sample ensemble R² = {r2:.3f}\nIn-sample ensemble MAE = {mae:.3f}\nIn-sample ensemble RMSE = {rmse:.3f}",transform=plt.gca().transAxes,va="top",fontsize=settings["legend_size"])
-        plt.xlabel(f"Experimental {target_label}",fontsize=settings["label_size"]); plt.ylabel(f"Predicted {target_label}",fontsize=settings["label_size"])
-        plt.title(f"Ensemble {model_name}: full training dataset",fontsize=settings["title_size"]); plt.legend(loc="lower right", fontsize=settings["legend_size"])
+        if show_prediction_errorbars: plt.errorbar(x,pred,yerr=sd,fmt="none",ecolor="#666666",elinewidth=1.5,alpha=0.95,capsize=2,zorder=2,label="±1 SD")
+        if len(x)>=3 and np.ptp(x)>0:
+            slope,intercept=np.polyfit(x,pred,1); x_fit=np.linspace(x.min(),x.max(),200); y_fit=intercept+slope*x_fit; residuals=pred-(intercept+slope*x); dof=len(x)-2; s_err=np.sqrt(np.sum(residuals**2)/dof); sxx=np.sum((x-x.mean())**2); se_fit=s_err*np.sqrt(1/len(x)+(x_fit-x.mean())**2/sxx); delta=t.ppf(0.975,dof)*se_fit
+            plt.fill_between(x_fit,y_fit-delta,y_fit+delta,color=settings["oof_color"],alpha=0.18,label="95% confidence interval",zorder=1); plt.plot(x_fit,y_fit,color=settings["oof_color"],linewidth=settings["line_width"],zorder=2,label="Regression fit")
+        plt.scatter(x,pred,s=settings["point_size"],alpha=settings["point_alpha"],color=settings["oof_color"],edgecolor=settings["bar_edge_color"],linewidth=settings["bar_edge_width"],label="Full-data ensemble",zorder=3); low=min(x.min(),pred.min()); high=max(x.max(),pred.max()); plt.plot([low,high],[low,high],color=settings["reference_line_color"],linewidth=settings["line_width"]); plt.xlabel(f"Experimental {target_label}",fontsize=settings["label_size"]); plt.ylabel(f"Predicted {target_label}",fontsize=settings["label_size"]); plt.title(f"Ensemble {model_name}: full training dataset",fontsize=settings["title_size"]); plt.legend(loc="upper center",bbox_to_anchor=(0.5,-0.20),ncol=2,fontsize=settings["legend_size"],frameon=True)
+        plt.subplots_adjust(bottom=0.28)
         if axis_limits is not None: plt.xlim(*axis_limits); plt.ylim(*axis_limits)
         if settings["equal_aspect"]: plt.gca().set_aspect("equal",adjustable="box")
-        _style_axes(settings); plt.tight_layout()
-        path=Path(results_dir)/f"full_ensemble_parity_{model_name}_{output_prefix}.{settings['file_format']}"
-        _finish_figure(path,save_figures,show_figures,settings); paths.append(path)
+        _style_axes(settings); plt.tight_layout(); path=Path(results_dir)/f"full_ensemble_parity_{model_name}_{output_prefix}.{settings['file_format']}"; _finish_figure(path,save_figures,show_figures,settings); paths.append(path)
     return paths
+

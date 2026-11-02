@@ -29,6 +29,7 @@ from __future__ import annotations
 from itertools import combinations
 from pathlib import Path
 import re
+from joblib import Parallel, delayed, parallel_backend
 from typing import Any, Iterable
 
 import matplotlib.pyplot as plt
@@ -42,14 +43,7 @@ from sklearn.base import BaseEstimator, TransformerMixin, clone
 from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
 from sklearn.feature_selection import RFE, SelectFromModel, SelectKBest, f_classif
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import (
-    accuracy_score,
-    balanced_accuracy_score,
-    confusion_matrix,
-    f1_score,
-    matthews_corrcoef,
-    roc_auc_score,
-)
+from sklearn.metrics import ( accuracy_score, balanced_accuracy_score, confusion_matrix, f1_score, matthews_corrcoef, roc_auc_score, )
 from sklearn.model_selection import RepeatedKFold, RepeatedStratifiedKFold
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.neural_network import MLPClassifier
@@ -58,13 +52,17 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 from xgboost import XGBClassifier
 
+import warnings
+import logging
+from sklearn.exceptions import ConvergenceWarning
+
+warnings.filterwarnings("ignore", category=ConvergenceWarning)
+warnings.filterwarnings("ignore", category=RuntimeWarning, message="invalid value encountered in divide")
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+logging.getLogger("optuna").setLevel(logging.WARNING)
+
 ### 1. Data loading and validation ###
-def evaluate_classification(
-    y_true: Iterable[int],
-    y_pred: Iterable[int],
-    probabilities: np.ndarray | None = None,
-    n_classes: int = 2,
-) -> dict[str, float]:
+def evaluate_classification( y_true: Iterable[int], y_pred: Iterable[int], probabilities: np.ndarray | None = None, n_classes: int = 2, ) -> dict[str, float]:
     """Return the common classification metrics used throughout the workflow."""
     metrics = {
         "accuracy": float(accuracy_score(y_true, y_pred)),
@@ -79,18 +77,9 @@ def evaluate_classification(
         probabilities = np.asarray(probabilities, dtype=float)
         try:
             if n_classes == 2:
-                metrics["roc_auc"] = float(
-                    roc_auc_score(y_true, probabilities[:, 1])
-                )
+                metrics["roc_auc"] = float( roc_auc_score(y_true, probabilities[:, 1]) )
             else:
-                metrics["roc_auc"] = float(
-                    roc_auc_score(
-                        y_true,
-                        probabilities,
-                        multi_class="ovr",
-                        average="macro",
-                    )
-                )
+                metrics["roc_auc"] = float( roc_auc_score( y_true, probabilities, multi_class="ovr", average="macro", ) )
         except ValueError:
             metrics["roc_auc"] = np.nan
 
@@ -104,6 +93,7 @@ def load_classification_data(
     id_columns: list[str] | None = None,
     drop_columns: list[str] | None = None,
     metadata_columns: list[str] | None = None,
+    round_digits: int = 15,
 ) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
     """Load numeric classification data and retain identifiers/split metadata."""
     id_columns = id_columns or []
@@ -115,24 +105,19 @@ def load_classification_data(
     retained_metadata = []
     for column in [*id_columns, *metadata_columns]:
         if not isinstance(column, str):
-            raise TypeError(
-                f"Metadata entries must be column-name strings, got {column!r}."
-            )
+            raise TypeError( f"Metadata entries must be column-name strings, got {column!r}." )
         if column in df.columns and column not in retained_metadata:
             retained_metadata.append(column)
     metadata = df[retained_metadata].copy()
-    df = df.drop(columns=drop_columns, errors="ignore").dropna(
-        subset=[target_column]
-    )
-    X = df.drop(
-        columns=[target_column] + retained_metadata,
-        errors="ignore",
-    ).apply(pd.to_numeric, errors="coerce")
+    df = df.drop(columns=drop_columns, errors="ignore").dropna( subset=[target_column] )
+    X = df.drop( columns=[target_column] + retained_metadata, errors="ignore", ).apply(pd.to_numeric, errors="coerce")
     y = pd.to_numeric(df[target_column], errors="coerce")
     valid = X.notna().all(axis=1) & y.notna()
     X = X.loc[valid].reset_index(drop=True)
     y = y.loc[valid].reset_index(drop=True)
     metadata = metadata.loc[valid].reset_index(drop=True)
+    X = X.round(round_digits)
+    y = y.round(round_digits)
     if X.empty:
         raise ValueError("No complete numeric rows remain after cleaning.")
     return X, y, metadata
@@ -149,26 +134,17 @@ def prepare_external_features(
     drop_columns = drop_columns or []
     training_columns = list(training_columns)
 
-    X_external = df_external.drop(
-        columns=[target_column] + id_columns + drop_columns,
-        errors="ignore",
-    )
+    X_external = df_external.drop( columns=[target_column] + id_columns + drop_columns, errors="ignore", )
     X_external = X_external.apply(pd.to_numeric, errors="coerce")
 
     missing_columns = [c for c in training_columns if c not in X_external.columns]
     if missing_columns:
-        raise ValueError(
-            f"External dataset is missing {len(missing_columns)} required features: "
-            f"{missing_columns}"
-        )
+        raise ValueError( f"External dataset is missing {len(missing_columns)} required features: " f"{missing_columns}" )
 
     X_external = X_external.loc[:, training_columns].reset_index(drop=True)
     nan_columns = X_external.columns[X_external.isna().any()].tolist()
     if nan_columns:
-        raise ValueError(
-            "External dataset contains missing or non-numeric values in: "
-            f"{nan_columns}"
-        )
+        raise ValueError( "External dataset contains missing or non-numeric values in: " f"{nan_columns}" )
 
     return X_external
 
@@ -217,9 +193,7 @@ class CorrelationFilter(BaseEstimator, TransformerMixin):
         # Restore original column order for predictable downstream output.
         selected_set = set(selected)
         self.selected_features_ = [c for c in X_df.columns if c in selected_set]
-        self.support_mask_ = np.asarray(
-            [c in selected_set for c in X_df.columns], dtype=bool
-        )
+        self.support_mask_ = np.asarray( [c in selected_set for c in X_df.columns], dtype=bool )
         return self
 
     def transform(self, X: pd.DataFrame | np.ndarray) -> pd.DataFrame:
@@ -265,19 +239,9 @@ class SafeRFE(RFE):
             self.n_features_to_select = requested_n
 
 ### 3. Model and feature-selector factories ###
-def build_model_from_trial(
-    model_name: str,
-    trial: optuna.Trial,
-    n_classes: int,
-    random_state: int = 42,
-):
+def build_model_from_trial(model_name: str, trial: optuna.Trial, n_classes: int, random_state: int = 42, n_jobs: int = 1):
     if model_name == "LogReg":
-        return LogisticRegression(
-            C=trial.suggest_float("C", 1e-3, 100, log=True),
-            class_weight="balanced",
-            max_iter=5000,
-            random_state=random_state,
-        )
+        return LogisticRegression( C=trial.suggest_float("C", 1e-3, 100, log=True), class_weight="balanced", max_iter=5000, random_state=random_state, )
     if model_name == "SVC":
         return SVC(
             C=trial.suggest_float("C", 1e-3, 100, log=True),
@@ -288,13 +252,7 @@ def build_model_from_trial(
             random_state=random_state,
         )
     if model_name == "KNN":
-        return KNeighborsClassifier(
-            n_neighbors=trial.suggest_int("n_neighbors", 2, 5),
-            weights=trial.suggest_categorical(
-                "weights",
-                ["uniform", "distance"],
-            ),
-        )
+        return KNeighborsClassifier( n_neighbors=trial.suggest_int("n_neighbors", 2, 5), weights=trial.suggest_categorical( "weights", ["uniform", "distance"], ), )
     if model_name == "RF":
         return RandomForestClassifier(
             n_estimators=trial.suggest_int("n_estimators", 20, 200),
@@ -307,7 +265,7 @@ def build_model_from_trial(
             ),
             class_weight="balanced",
             random_state=random_state,
-            n_jobs=1,
+            n_jobs=n_jobs,
         )
     if model_name == "HistGB":
         return HistGradientBoostingClassifier(
@@ -364,7 +322,7 @@ def build_model_from_trial(
             ),
             "eval_metric": "logloss" if n_classes == 2 else "mlogloss",
             "random_state": random_state,
-            "n_jobs": 1,
+            "n_jobs": n_jobs,
         }
         if n_classes > 2:
             model_parameters["num_class"] = n_classes
@@ -410,41 +368,18 @@ def remove_feature_selection_params(params: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in params.items() if key not in fs_params}
 
 
-def build_final_model_from_params(
-    model_name: str,
-    params: dict[str, Any],
-    n_classes: int,
-    random_state: int = 42,
-):
+def build_final_model_from_params(model_name: str, params: dict[str, Any], n_classes: int, random_state: int = 42, n_jobs: int = 1):
     params = remove_feature_selection_params(dict(params))
     if model_name == "LogReg":
-        return LogisticRegression(
-            **params,
-            class_weight="balanced",
-            max_iter=5000,
-            random_state=random_state,
-        )
+        return LogisticRegression( **params, class_weight="balanced", max_iter=5000, random_state=random_state, )
     if model_name == "SVC":
-        return SVC(
-            **params,
-            probability=True,
-            class_weight="balanced",
-            random_state=random_state,
-        )
+        return SVC( **params, probability=True, class_weight="balanced", random_state=random_state, )
     if model_name == "KNN":
         return KNeighborsClassifier(**params)
     if model_name == "RF":
-        return RandomForestClassifier(
-            **params,
-            class_weight="balanced",
-            random_state=random_state,
-            n_jobs=1,
-        )
+        return RandomForestClassifier( **params, class_weight="balanced", random_state=random_state, n_jobs=n_jobs, )
     if model_name == "HistGB":
-        return HistGradientBoostingClassifier(
-            **params,
-            random_state=random_state,
-        )
+        return HistGradientBoostingClassifier( **params, random_state=random_state, )
     if model_name == "XGB":
         model_parameters = {
             **params,
@@ -453,44 +388,22 @@ def build_final_model_from_params(
             ),
             "eval_metric": "logloss" if n_classes == 2 else "mlogloss",
             "random_state": random_state,
-            "n_jobs": 1,
+            "n_jobs": n_jobs,
         }
         if n_classes > 2:
             model_parameters["num_class"] = n_classes
         return XGBClassifier(**model_parameters)
     if model_name == "NN":
-        return MLPClassifier(
-            **params,
-            early_stopping=True,
-            validation_fraction=0.2,
-            n_iter_no_change=30,
-            max_iter=3000,
-            random_state=random_state,
-        )
+        return MLPClassifier( **params, early_stopping=True, validation_fraction=0.2, n_iter_no_change=30, max_iter=3000, random_state=random_state, )
     raise ValueError(f"Unknown model: {model_name}")
 
 
-def build_feature_selector_from_trial(
-    trial: optuna.Trial,
-    max_features_cap: int,
-    min_features: int = 1,
-    random_state: int = 42,
-):
+def build_feature_selector_from_trial(trial: optuna.Trial, max_features_cap: int, min_features: int = 1, random_state: int = 42, rfe_step: int | float = 1, n_jobs: int = 1):
     min_features = max(1, min(int(min_features), int(max_features_cap)))
-    selector_name = trial.suggest_categorical(
-        "feature_selector",
-        ["selectkbest", "logreg_feature", "rf_feature", "rfe_feature"],
-    )
+    selector_name = trial.suggest_categorical( "feature_selector", ["selectkbest", "logreg_feature", "rf_feature", "rfe_feature"], )
 
     if selector_name == "selectkbest":
-        selector = SafeSelectKBest(
-            score_func=f_classif,
-            k=trial.suggest_int(
-                "selectkbest_k",
-                min_features,
-                max_features_cap,
-            ),
-        )
+        selector = SafeSelectKBest( score_func=f_classif, k=trial.suggest_int( "selectkbest_k", min_features, max_features_cap, ), )
     elif selector_name == "logreg_feature":
         selector = SelectFromModel(
             estimator=LogisticRegression(
@@ -522,7 +435,7 @@ def build_feature_selector_from_trial(
                 ),
                 class_weight="balanced",
                 random_state=random_state,
-                n_jobs=1,
+                n_jobs=n_jobs,
             ),
             threshold=trial.suggest_categorical(
                 "rf_threshold_feature",
@@ -543,6 +456,7 @@ def build_feature_selector_from_trial(
                 min_features,
                 max_features_cap,
             ),
+            step=rfe_step,
         )
     else:
         raise ValueError(f"Unknown feature selector: {selector_name}")
@@ -558,17 +472,10 @@ def get_selected_feature_names(fitted_pipe: Pipeline) -> list[str]:
     return list(names)
 
 
-def get_model_probabilities(
-    fitted_model: Pipeline,
-    X_input: pd.DataFrame,
-    n_classes: int,
-) -> np.ndarray:
+def get_model_probabilities( fitted_model: Pipeline, X_input: pd.DataFrame, n_classes: int, ) -> np.ndarray:
     """Return a complete probability matrix for any fitted classifier."""
     if hasattr(fitted_model, "predict_proba"):
-        probabilities = np.asarray(
-            fitted_model.predict_proba(X_input),
-            dtype=float,
-        )
+        probabilities = np.asarray( fitted_model.predict_proba(X_input), dtype=float, )
         if probabilities.shape[1] == n_classes:
             return probabilities
 
@@ -580,11 +487,7 @@ def get_model_probabilities(
 
 ### 4. Split-generation strategies and class thresholds ###
 
-def _make_y_bins(
-    y: pd.Series,
-    requested_bins: int,
-    n_splits: int,
-) -> np.ndarray:
+def _make_y_bins( y: pd.Series, requested_bins: int, n_splits: int, ) -> np.ndarray:
     """Create quantile bins with enough observations for stratified folds."""
     max_bins = min(int(requested_bins), int(pd.Series(y).nunique()))
 
@@ -594,31 +497,17 @@ def _make_y_bins(
         if len(counts) >= 2 and counts.min() >= n_splits:
             return np.asarray(bins, dtype=int)
 
-    raise ValueError(
-        "Could not create y-stratification bins with at least "
-        f"{n_splits} observations per bin."
-    )
+    raise ValueError( "Could not create y-stratification bins with at least " f"{n_splits} observations per bin." )
 
-def _repeated_group_splits(
-    groups: Iterable[Any],
-    n_splits: int,
-    n_repeats: int,
-    random_state: int,
-):
+def _repeated_group_splits( groups: Iterable[Any], n_splits: int, n_repeats: int, random_state: int, ):
     """Repeated group-wise folds with approximately balanced row counts."""
     groups = np.asarray(groups)
     unique_groups = np.asarray(pd.unique(groups))
 
     if len(unique_groups) < n_splits:
-        raise ValueError(
-            f"Group split requires at least {n_splits} unique groups; "
-            f"found {len(unique_groups)}."
-        )
+        raise ValueError( f"Group split requires at least {n_splits} unique groups; " f"found {len(unique_groups)}." )
 
-    group_sizes = {
-        group: int(np.sum(groups == group))
-        for group in unique_groups
-    }
+    group_sizes = { group: int(np.sum(groups == group)) for group in unique_groups }
     rng = np.random.RandomState(random_state)
 
     for _ in range(n_repeats):
@@ -628,11 +517,7 @@ def _repeated_group_splits(
         fold_groups = [[] for _ in range(n_splits)]
         fold_sizes = np.zeros(n_splits, dtype=int)
 
-        for group in sorted(
-            shuffled,
-            key=lambda value: group_sizes[value],
-            reverse=True,
-        ):
+        for group in sorted( shuffled, key=lambda value: group_sizes[value], reverse=True, ):
             fold_index = int(np.argmin(fold_sizes))
             fold_groups[fold_index].append(group)
             fold_sizes[fold_index] += group_sizes[group]
@@ -641,12 +526,7 @@ def _repeated_group_splits(
             test_mask = np.isin(groups, test_groups)
             yield np.flatnonzero(~test_mask), np.flatnonzero(test_mask)
 
-def _y_equidistant_splits(
-    y: pd.Series,
-    n_splits: int,
-    n_repeats: int,
-    random_state: int,
-):
+def _y_equidistant_splits( y: pd.Series, n_splits: int, n_repeats: int, random_state: int, ):
     """Distribute sorted y values across folds so every fold spans the y range."""
     y_values = np.asarray(y, dtype=float)
     rng = np.random.RandomState(random_state)
@@ -668,10 +548,7 @@ def _y_equidistant_splits(
             train_index = np.flatnonzero(fold_assignment != fold_index)
             yield train_index, test_index
 
-def kennard_stone_indices(
-    X: pd.DataFrame,
-    test_fraction: float = 0.20,
-) -> tuple[np.ndarray, np.ndarray]:
+def kennard_stone_indices( X: pd.DataFrame, test_fraction: float = 0.20, ) -> tuple[np.ndarray, np.ndarray]:
     """Create one Kennard–Stone holdout split using standardized X distances."""
     if not 0 < test_fraction < 1:
         raise ValueError("ks_test_fraction must be between 0 and 1.")
@@ -688,11 +565,7 @@ def kennard_stone_indices(
         raise ValueError("Kennard–Stone test set must be smaller than the dataset.")
 
     squared_norms = np.sum(standardized ** 2, axis=1)
-    distances = (
-        squared_norms[:, None]
-        + squared_norms[None, :]
-        - 2 * standardized @ standardized.T
-    )
+    distances = ( squared_norms[:, None] + squared_norms[None, :] - 2 * standardized @ standardized.T )
     np.maximum(distances, 0, out=distances)
 
     first, second = np.unravel_index(np.argmax(distances), distances.shape)
@@ -706,24 +579,14 @@ def kennard_stone_indices(
     while len(selected) < n_test:
         next_index = int(np.argmax(minimum_distance))
         selected.append(next_index)
-        minimum_distance = np.minimum(
-            minimum_distance,
-            distances[:, next_index],
-        )
+        minimum_distance = np.minimum( minimum_distance, distances[:, next_index], )
         minimum_distance[selected] = -np.inf
 
     test_index = np.asarray(sorted(selected), dtype=int)
-    train_index = np.setdiff1d(
-        np.arange(n_samples),
-        test_index,
-        assume_unique=True,
-    )
+    train_index = np.setdiff1d( np.arange(n_samples), test_index, assume_unique=True, )
     return train_index, test_index
 
-def _predefined_splits(
-    labels: Iterable[Any],
-    train_label: Any = "train",
-):
+def _predefined_splits( labels: Iterable[Any], train_label: Any = "train", ):
     """Build user-defined train/test splits from a metadata column."""
     labels = pd.Series(labels).reset_index(drop=True)
     if labels.isna().any():
@@ -734,40 +597,19 @@ def _predefined_splits(
     train_label_normalized = str(train_label).lower()
 
     if train_label_normalized in set(normalized):
-        train_index = np.flatnonzero(
-            normalized.to_numpy() == train_label_normalized
-        )
-        test_labels = [
-            label
-            for label in unique_labels
-            if str(label).lower() != train_label_normalized
-        ]
+        train_index = np.flatnonzero( normalized.to_numpy() == train_label_normalized )
+        test_labels = [ label for label in unique_labels if str(label).lower() != train_label_normalized ]
         if not test_labels:
-            raise ValueError(
-                "The predefined split column contains a train label but no test label."
-            )
-        return [
-            (
-                train_index,
-                np.flatnonzero(labels.to_numpy() == test_label),
-            )
-            for test_label in test_labels
-        ]
+            raise ValueError( "The predefined split column contains a train label but no test label." )
+        return [ ( train_index, np.flatnonzero(labels.to_numpy() == test_label), ) for test_label in test_labels ]
 
     if len(unique_labels) < 2:
-        raise ValueError(
-            "The predefined split column must contain at least two labels."
-        )
+        raise ValueError( "The predefined split column must contain at least two labels." )
 
     splits = []
     for test_label in unique_labels:
         test_mask = labels.to_numpy() == test_label
-        splits.append(
-            (
-                np.flatnonzero(~test_mask),
-                np.flatnonzero(test_mask),
-            )
-        )
+        splits.append( ( np.flatnonzero(~test_mask), np.flatnonzero(test_mask), ) )
     return splits
 
 def class_labels(n_classes: int) -> list[str]:
@@ -779,20 +621,11 @@ def class_labels(n_classes: int) -> list[str]:
     return [f"Class_{index + 1}" for index in range(n_classes)]
 
 
-def classes_from_thresholds(
-    y_continuous: Iterable[float],
-    thresholds: Iterable[float],
-) -> pd.Series:
+def classes_from_thresholds( y_continuous: Iterable[float], thresholds: Iterable[float], ) -> pd.Series:
     """Convert a continuous response into ordered integer classes."""
     y_values = np.asarray(pd.Series(y_continuous), dtype=float)
-    sorted_thresholds = np.asarray(
-        sorted(float(value) for value in thresholds),
-        dtype=float,
-    )
-    return pd.Series(
-        np.digitize(y_values, sorted_thresholds, right=True),
-        dtype=int,
-    )
+    sorted_thresholds = np.asarray( sorted(float(value) for value in thresholds), dtype=float, )
+    return pd.Series( np.digitize(y_values, sorted_thresholds, right=True), dtype=int, )
 
 
 def candidate_threshold_sets(
@@ -805,20 +638,12 @@ def candidate_threshold_sets(
     """Generate valid numerical-threshold or quantile combinations."""
     threshold_mode = threshold_mode.lower()
     if threshold_mode not in {"fixed-grid", "quantiles"}:
-        raise ValueError(
-            "threshold_mode must be either 'fixed-grid' or 'quantiles'."
-        )
+        raise ValueError( "threshold_mode must be either 'fixed-grid' or 'quantiles'." )
 
     n_thresholds = int(n_classes) - 1
-    pool = (
-        threshold_candidates
-        if threshold_mode == "fixed-grid"
-        else threshold_quantiles
-    )
+    pool = ( threshold_candidates if threshold_mode == "fixed-grid" else threshold_quantiles )
     if not pool:
-        raise ValueError(
-            f"Provide candidates for threshold_mode={threshold_mode!r}."
-        )
+        raise ValueError( f"Provide candidates for threshold_mode={threshold_mode!r}." )
 
     pool = sorted(set(float(value) for value in pool))
     if threshold_mode == "quantiles":
@@ -828,11 +653,7 @@ def candidate_threshold_sets(
 
     candidate_sets = []
     for values in combinations(pool, n_thresholds):
-        if (
-            threshold_mode == "quantiles"
-            and len(values) > 1
-            and np.min(np.diff(values)) < min_quantile_gap
-        ):
+        if ( threshold_mode == "quantiles" and len(values) > 1 and np.min(np.diff(values)) < min_quantile_gap ):
             continue
         candidate_sets.append(tuple(values))
 
@@ -841,17 +662,9 @@ def candidate_threshold_sets(
     return candidate_sets
 
 
-def valid_class_counts(
-    y_classes: Iterable[int],
-    n_classes: int,
-    min_class_count: int,
-) -> bool:
+def valid_class_counts( y_classes: Iterable[int], n_classes: int, min_class_count: int, ) -> bool:
     """Check that every ordered class contains enough training observations."""
-    counts = (
-        pd.Series(y_classes)
-        .value_counts()
-        .reindex(range(n_classes), fill_value=0)
-    )
+    counts = ( pd.Series(y_classes) .value_counts() .reindex(range(n_classes), fill_value=0) )
     return bool((counts >= int(min_class_count)).all())
 
 def make_classification_splits(
@@ -873,87 +686,44 @@ def make_classification_splits(
     strategy = strategy.lower()
 
     if strategy == "random":
-        splitter = RepeatedKFold(
-            n_splits=n_splits,
-            n_repeats=n_repeats,
-            random_state=random_state,
-        )
+        splitter = RepeatedKFold( n_splits=n_splits, n_repeats=n_repeats, random_state=random_state, )
         return list(splitter.split(X))
 
     if strategy == "y_stratified":
         y_bins = _make_y_bins(y, y_stratify_bins, n_splits)
-        splitter = RepeatedStratifiedKFold(
-            n_splits=n_splits,
-            n_repeats=n_repeats,
-            random_state=random_state,
-        )
+        splitter = RepeatedStratifiedKFold( n_splits=n_splits, n_repeats=n_repeats, random_state=random_state, )
         return list(splitter.split(X, y_bins))
 
     if strategy == "y_equidistant":
-        return list(
-            _y_equidistant_splits(
-                y=y,
-                n_splits=n_splits,
-                n_repeats=n_repeats,
-                random_state=random_state,
-            )
-        )
+        return list( _y_equidistant_splits( y=y, n_splits=n_splits, n_repeats=n_repeats, random_state=random_state, ) )
 
     if strategy in {"group", "cluster"}:
         if groups is None:
             raise ValueError("A group split requires group labels.")
         if pd.Series(groups).isna().any():
             raise ValueError("Group labels contain missing values.")
-        return list(
-            _repeated_group_splits(
-                groups=groups,
-                n_splits=n_splits,
-                n_repeats=n_repeats,
-                random_state=random_state,
-            )
-        )
+        return list( _repeated_group_splits( groups=groups, n_splits=n_splits, n_repeats=n_repeats, random_state=random_state, ) )
 
     if strategy == "leave_group_out":
         if groups is None or not held_out_groups:
-            raise ValueError(
-                "leave_group_out requires split_group_columns and "
-                "held_out_groups."
-            )
+            raise ValueError( "leave_group_out requires split_group_columns and " "held_out_groups." )
         group_series = pd.Series(groups).reset_index(drop=True)
         test_mask = group_series.isin(held_out_groups).to_numpy()
         if not test_mask.any():
             raise ValueError("None of the held_out_groups were found.")
         if test_mask.all():
             raise ValueError("held_out_groups contains every observation.")
-        return [
-            (
-                np.flatnonzero(~test_mask),
-                np.flatnonzero(test_mask),
-            )
-        ]
+        return [ ( np.flatnonzero(~test_mask), np.flatnonzero(test_mask), ) ]
 
     if strategy == "predefined":
         if predefined_labels is None:
-            raise ValueError(
-                "predefined split requires predefined_split_column."
-            )
-        return _predefined_splits(
-            labels=predefined_labels,
-            train_label=predefined_train_label,
-        )
+            raise ValueError( "predefined split requires predefined_split_column." )
+        return _predefined_splits( labels=predefined_labels, train_label=predefined_train_label, )
 
     if strategy in {"ks", "ks_holdout"}:
-        return [
-            kennard_stone_indices(
-                X=X,
-                test_fraction=ks_test_fraction,
-            )
-        ]
+        return [ kennard_stone_indices( X=X, test_fraction=ks_test_fraction, ) ]
 
-    raise ValueError(
-        "Unknown split strategy. Choose: random, y_stratified, "
-        "y_equidistant, group, leave_group_out, predefined, or ks_holdout."
-    )
+    raise ValueError( "Unknown split strategy. Choose: random, y_stratified, " "y_equidistant, group, leave_group_out, predefined, or ks_holdout." )
 
 ### 5. Inner optimization and outer-fold training ###
 def train_outer_fold(
@@ -962,7 +732,7 @@ def train_outer_fold(
     inner_cv_splits, inner_cv_repeats, max_features_cap, min_features,
     corr_threshold, n_trials, overfit_penalty_weight, optimize_metric, random_state,
     inner_split_strategy="y_stratified", inner_groups=None, y_stratify_bins=5,
-    min_class_count=5, min_quantile_gap=0.05,
+    min_class_count=5, min_quantile_gap=0.05, rfe_step=1, one_se=False, n_jobs=1,
 ):
     # The inner splits are created only from the current outer-training set.
     # They are used exclusively for Optuna model/selector/threshold selection.
@@ -970,9 +740,7 @@ def train_outer_fold(
     X_test_outer = X_test_outer.reset_index(drop=True)
     y_train_cont_outer = pd.Series(y_train_cont_outer).reset_index(drop=True).astype(float)
     y_test_cont_outer = pd.Series(y_test_cont_outer).reset_index(drop=True).astype(float)
-    candidates = candidate_threshold_sets(
-        threshold_mode, threshold_candidates, threshold_quantiles, n_classes, min_quantile_gap
-    )
+    candidates = candidate_threshold_sets( threshold_mode, threshold_candidates, threshold_quantiles, n_classes, min_quantile_gap )
     inner_splits = make_classification_splits(
         X=X_train_outer, y=y_train_cont_outer, n_classes=n_classes,
         n_splits=inner_cv_splits, n_repeats=inner_cv_repeats,
@@ -985,38 +753,25 @@ def train_outer_fold(
             # One Optuna trial defines both a feature-selection strategy and the
             # model hyperparameters. Thresholds are evaluated inside every inner
             # training fold so preprocessing never sees validation observations.
-            selector, _ = build_feature_selector_from_trial(
-                trial, max_features_cap, min_features, random_state
-            )
+            selector, _ = build_feature_selector_from_trial(trial, max_features_cap, min_features, random_state, rfe_step, n_jobs)
             model = build_model_from_trial(model_name, trial, n_classes, random_state)
-            pipe = Pipeline([
-                ("correlation_filter", CorrelationFilter(corr_threshold)),
-                ("scaler", StandardScaler()),
-                ("selector", selector),
-                ("model", model),
-            ])
-            train_scores, validation_scores = [], []
+            pipe = Pipeline([ ("correlation_filter", CorrelationFilter(corr_threshold)), ("scaler", StandardScaler()), ("selector", selector), ("model", model), ])
+            train_scores, validation_scores, feature_counts = [], [], []
             for train_index, validation_index in inner_splits:
                 X_train = X_train_outer.iloc[train_index]
                 X_validation = X_train_outer.iloc[validation_index]
                 y_train_cont = y_train_cont_outer.iloc[train_index]
                 y_validation_cont = y_train_cont_outer.iloc[validation_index]
-                thresholds = (
-                    list(candidate) if threshold_mode == "fixed-grid"
-                    else [float(y_train_cont.quantile(q)) for q in candidate]
-                )
+                thresholds = ( list(candidate) if threshold_mode == "fixed-grid" else [float(y_train_cont.quantile(q)) for q in candidate] )
                 if len(set(np.round(thresholds, 12))) != len(thresholds):
                     return -1e9
                 y_train = classes_from_thresholds(y_train_cont, thresholds)
                 y_validation = classes_from_thresholds(y_validation_cont, thresholds)
                 try:
                     pipe.fit(X_train, y_train)
-                    train_scores.append(
-                        evaluate_classification(y_train, pipe.predict(X_train))[optimize_metric]
-                    )
-                    validation_scores.append(
-                        evaluate_classification(y_validation, pipe.predict(X_validation))[optimize_metric]
-                    )
+                    feature_counts.append(len(get_selected_feature_names(pipe)))
+                    train_scores.append( evaluate_classification(y_train, pipe.predict(X_train))[optimize_metric] )
+                    validation_scores.append( evaluate_classification(y_validation, pipe.predict(X_validation))[optimize_metric] )
                 except Exception:
                     return -1e9
             mean_train = float(np.nanmean(train_scores))
@@ -1024,39 +779,36 @@ def train_outer_fold(
             if np.isnan(mean_validation):
                 return -1e9
             overfit_penalty = max(0.0, mean_train - mean_validation)
+            trial.set_user_attr("n_features", float(np.mean(feature_counts)))
+            trial.set_user_attr("validation_mean", mean_validation)
+            trial.set_user_attr("validation_se", float(np.std(validation_scores, ddof=1) / np.sqrt(len(validation_scores))) if len(validation_scores) > 1 else 0.0)
             return mean_validation - overfit_penalty_weight * overfit_penalty
-        study = optuna.create_study(
-            direction="maximize",
-            sampler=optuna.samplers.TPESampler(seed=random_state + candidate_index),
-        )
-        study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+        study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=random_state + candidate_index))
+        study.optimize(objective, n_trials=n_trials, n_jobs=1, show_progress_bar=False)
         if study.best_value > -1e10:
+            chosen_trial = study.best_trial
+            if one_se:
+                valid_trials = [t for t in study.trials if "validation_mean" in t.user_attrs and "n_features" in t.user_attrs]
+                if valid_trials:
+                    best_validation_trial = max(valid_trials, key=lambda t: t.user_attrs["validation_mean"])
+                    cutoff = best_validation_trial.user_attrs["validation_mean"] - best_validation_trial.user_attrs.get("validation_se", 0.0)
+                    eligible = [t for t in valid_trials if t.user_attrs["validation_mean"] >= cutoff]
+                    chosen_trial = min(eligible, key=lambda t: (t.user_attrs["n_features"], -t.user_attrs["validation_mean"]))
             candidate_results.append({
                 "candidate_values": tuple(candidate),
-                "best_inner_score": float(study.best_value),
-                "best_params": dict(study.best_params),
+                "best_inner_score": float(chosen_trial.value),
+                "best_params": dict(chosen_trial.params),
+                "best_trial_features": chosen_trial.user_attrs.get("n_features"),
             })
     best = max(candidate_results, key=lambda row: row["best_inner_score"])
     best_quantiles = list(best["candidate_values"]) if threshold_mode == "quantiles" else []
-    best_thresholds = (
-        list(best["candidate_values"]) if threshold_mode == "fixed-grid"
-        else [float(y_train_cont_outer.quantile(q)) for q in best_quantiles]
-    )
+    best_thresholds = ( list(best["candidate_values"]) if threshold_mode == "fixed-grid" else [float(y_train_cont_outer.quantile(q)) for q in best_quantiles] )
     y_train = classes_from_thresholds(y_train_cont_outer, best_thresholds)
     y_test = classes_from_thresholds(y_test_cont_outer, best_thresholds)
     fixed_trial = optuna.trial.FixedTrial(best["best_params"])
-    final_selector, selector_name = build_feature_selector_from_trial(
-        fixed_trial, max_features_cap, min_features, random_state
-    )
-    final_model = build_final_model_from_params(
-        model_name, best["best_params"], n_classes, random_state
-    )
-    final_pipe = Pipeline([
-        ("correlation_filter", CorrelationFilter(corr_threshold)),
-        ("scaler", StandardScaler()),
-        ("selector", final_selector),
-        ("model", final_model),
-    ])
+    final_selector, selector_name = build_feature_selector_from_trial(fixed_trial, max_features_cap, min_features, random_state, rfe_step, n_jobs)
+    final_model = build_final_model_from_params(model_name, best["best_params"], n_classes, random_state, n_jobs)
+    final_pipe = Pipeline([ ("correlation_filter", CorrelationFilter(corr_threshold)), ("scaler", StandardScaler()), ("selector", final_selector), ("model", final_model), ])
     # After Optuna chooses the best trial, refit that complete pipeline on all
     # observations available in the current outer-training fold.
     final_pipe.fit(X_train_outer, y_train)
@@ -1089,10 +841,7 @@ class EnsembleModel:
         self.models = [member["pipeline"] for member in members]
         self.class_names = class_names
     def predict_proba_members(self, X_input):
-        return np.stack([
-            get_model_probabilities(member["pipeline"], X_input, len(self.class_names))
-            for member in self.members
-        ], axis=0)
+        return np.stack([ get_model_probabilities(member["pipeline"], X_input, len(self.class_names)) for member in self.members ], axis=0)
     def predict_proba(self, X_input):
         return self.predict_proba_members(X_input).mean(axis=0)
     def predict(self, X_input):
@@ -1100,11 +849,7 @@ class EnsembleModel:
 
 
 
-def refit_full_training_ensembles(
-    cv_models_dict: dict[str, EnsembleModel],
-    X: pd.DataFrame,
-    y: pd.Series | Iterable[float],
-) -> dict[str, EnsembleModel]:
+def refit_full_training_ensembles( cv_models_dict: dict[str, EnsembleModel], X: pd.DataFrame, y: pd.Series | Iterable[float], ) -> dict[str, EnsembleModel]:
     """Refit every selected outer-fold pipeline on the complete dataset.
 
     Nested-CV models remain reserved for unbiased OOF evaluation. The returned
@@ -1124,15 +869,8 @@ def refit_full_training_ensembles(
             y_classes = classes_from_thresholds(y_full, thresholds)
             pipeline = clone(member["pipeline"])
             pipeline.fit(X_full, y_classes)
-            full_members.append({
-                **member,
-                "pipeline": pipeline,
-                "training_scope": "full_dataset",
-            })
-        full_models[model_name] = EnsembleModel(
-            full_members,
-            cv_ensemble.class_names,
-        )
+            full_members.append({ **member, "pipeline": pipeline, "training_scope": "full_dataset", })
+        full_models[model_name] = EnsembleModel( full_members, cv_ensemble.class_names, )
 
     return full_models
 
@@ -1142,11 +880,7 @@ def _majority_vote(values: Iterable[int]) -> int:
     return int(np.flatnonzero(counts == counts.max())[0])
 
 
-def build_composite_groups(
-    metadata: pd.DataFrame,
-    group_columns: list[str] | None,
-    separator: str = " | ",
-) -> pd.Series | None:
+def build_composite_groups( metadata: pd.DataFrame, group_columns: list[str] | None, separator: str = " | ", ) -> pd.Series | None:
     """Build one group label from one or several metadata columns."""
     if not group_columns:
         return None
@@ -1168,13 +902,12 @@ def run_nested_classification(
     split_group_columns=None, y_stratify_bins=5, ks_test_fraction=0.20,
     held_out_groups=None, predefined_split_column=None,
     predefined_train_label="train", export_split_indices=False,
-    export_test_groups=True, max_test_groups_to_export=50,
+    export_test_groups=True, max_test_groups_to_export=50, rfe_step=1, n_jobs=1, one_se=False,
 ):
     """Run nested CV with configurable outer and inner split strategies."""
     max_features_cap = min(max_features_cap, X.shape[1])
     min_features = max(1, min(int(min_features), max_features_cap))
-    metadata = (metadata.reset_index(drop=True) if metadata is not None
-                else pd.DataFrame(index=np.arange(len(X))))
+    metadata = (metadata.reset_index(drop=True) if metadata is not None else pd.DataFrame(index=np.arange(len(X))))
     groups = build_composite_groups(metadata, split_group_columns)
     predefined_labels = None
     if predefined_split_column is not None:
@@ -1195,19 +928,10 @@ def run_nested_classification(
     split_manifest, split_assignments, models_dict = [], [], {}
     for fold_number, (train_index, test_index) in enumerate(outer_splits, 1):
         for sample_index in train_index:
-            split_assignments.append({
-                "Fold": fold_number, "Sample_ID": int(sample_index),
-                "Set": "Training", "Target": float(y.iloc[int(sample_index)]),
-            })
+            split_assignments.append({ "Fold": fold_number, "Sample_ID": int(sample_index), "Set": "Training", "Target": float(y.iloc[int(sample_index)]), })
         for sample_index in test_index:
-            split_assignments.append({
-                "Fold": fold_number, "Sample_ID": int(sample_index),
-                "Set": "Validation", "Target": float(y.iloc[int(sample_index)]),
-            })
-        row = {
-            "Fold": fold_number, "Outer_Split_Strategy": outer_split_strategy,
-            "N_Train": len(train_index), "N_Test": len(test_index),
-        }
+            split_assignments.append({ "Fold": fold_number, "Sample_ID": int(sample_index), "Set": "Validation", "Target": float(y.iloc[int(sample_index)]), })
+        row = { "Fold": fold_number, "Outer_Split_Strategy": outer_split_strategy, "N_Train": len(train_index), "N_Test": len(test_index), }
         if export_split_indices:
             row["Train_Indices"] = ", ".join(map(str, train_index))
             row["Test_Indices"] = ", ".join(map(str, test_index))
@@ -1220,47 +944,49 @@ def run_nested_classification(
                 row["Test_Groups"] = ", ".join(map(str, test_groups[:max_test_groups_to_export]))
                 row["Test_Groups_Truncated"] = len(test_groups) > max_test_groups_to_export
         if predefined_labels is not None:
-            row["Test_Predefined_Labels"] = ", ".join(
-                map(str, pd.unique(predefined_labels.iloc[test_index]))
-            )
+            row["Test_Predefined_Labels"] = ", ".join( map(str, pd.unique(predefined_labels.iloc[test_index])) )
         split_manifest.append(row)
-    # Each model family is evaluated on exactly the same outer splits, which
-    # makes the model comparison paired and therefore easier to interpret.
     labels = class_labels(n_classes)
+    def _fit_outer(model_name, fold, train_index, test_index):
+        inner_groups = (groups.iloc[train_index].reset_index(drop=True) if groups is not None and inner_split_strategy in {"group", "cluster"} else None)
+        if inner_split_strategy in {"ks", "ks_holdout", "predefined", "leave_group_out"}:
+            raise ValueError(f"{inner_split_strategy!r} is not supported for inner CV")
+        return train_outer_fold(
+            model_name=model_name,
+            X_train_outer=X.iloc[train_index].reset_index(drop=True),
+            y_train_cont_outer=y.iloc[train_index].reset_index(drop=True),
+            X_test_outer=X.iloc[test_index].reset_index(drop=True),
+            y_test_cont_outer=y.iloc[test_index].reset_index(drop=True),
+            threshold_mode=threshold_mode, threshold_candidates=threshold_candidates,
+            threshold_quantiles=threshold_quantiles, n_classes=n_classes,
+            inner_cv_splits=inner_cv_splits, inner_cv_repeats=inner_cv_repeats,
+            max_features_cap=max_features_cap, min_features=min_features,
+            corr_threshold=corr_threshold, n_trials=n_trials,
+            overfit_penalty_weight=overfit_penalty_weight,
+            optimize_metric=optimize_metric, random_state=random_state + fold,
+            inner_split_strategy=inner_split_strategy, inner_groups=inner_groups,
+            y_stratify_bins=y_stratify_bins, min_class_count=min_class_count,
+            min_quantile_gap=min_quantile_gap, rfe_step=rfe_step, one_se=one_se, n_jobs=1)
+
     for model_name in model_names:
         if verbose:
             print(f"\
 Starting {model_name}")
         members = []
+        if n_jobs > 1:
+            with parallel_backend("loky", inner_max_num_threads=1):
+                fold_results = Parallel(n_jobs=min(n_jobs, len(outer_splits)))( delayed(_fit_outer)(model_name, fold, tr, te) for fold, (tr, te) in enumerate(outer_splits, 1))
+        else:
+            fold_results = None
         for fold, (train_index, test_index) in enumerate(outer_splits, 1):
             if verbose:
                 print(f"  Fold {fold}/{len(outer_splits)}")
-            inner_groups = (
-                groups.iloc[train_index].reset_index(drop=True)
-                if groups is not None and inner_split_strategy in {"group", "cluster"}
-                else None
-            )
+            inner_groups = ( groups.iloc[train_index].reset_index(drop=True) if groups is not None and inner_split_strategy in {"group", "cluster"} else None )
             if inner_split_strategy in {"ks", "ks_holdout", "predefined", "leave_group_out"}:
                 raise ValueError(f"{inner_split_strategy!r} is not supported for inner CV.")
             # Tune on the inner CV and evaluate once on this outer validation
             # fold. The returned pipeline becomes one member of the ensemble.
-            result = train_outer_fold(
-                model_name=model_name,
-                X_train_outer=X.iloc[train_index].reset_index(drop=True),
-                y_train_cont_outer=y.iloc[train_index].reset_index(drop=True),
-                X_test_outer=X.iloc[test_index].reset_index(drop=True),
-                y_test_cont_outer=y.iloc[test_index].reset_index(drop=True),
-                threshold_mode=threshold_mode, threshold_candidates=threshold_candidates,
-                threshold_quantiles=threshold_quantiles, n_classes=n_classes,
-                inner_cv_splits=inner_cv_splits, inner_cv_repeats=inner_cv_repeats,
-                max_features_cap=max_features_cap, min_features=min_features,
-                corr_threshold=corr_threshold, n_trials=n_trials,
-                overfit_penalty_weight=overfit_penalty_weight,
-                optimize_metric=optimize_metric, random_state=random_state + fold,
-                inner_split_strategy=inner_split_strategy, inner_groups=inner_groups,
-                y_stratify_bins=y_stratify_bins, min_class_count=min_class_count,
-                min_quantile_gap=min_quantile_gap,
-            )
+            result = (fold_results[fold - 1] if fold_results is not None else _fit_outer(model_name, fold, train_index, test_index))
             for local_index, original_index in enumerate(test_index):
                 row = {
                     "Model": model_name, "Fold": fold,
@@ -1297,26 +1023,12 @@ Starting {model_name}")
             params.append(metric_row)
             fold_rows.append({"Model": model_name, "Fold": fold, **result["metrics_test"]})
             for feature in result["selected_features"]:
-                selected.append({
-                    "Model": model_name, "Fold": fold,
-                    "Feature_Selection_Method": result["feature_selection_method"],
-                    "Feature": feature,
-                })
+                selected.append({ "Model": model_name, "Fold": fold, "Feature_Selection_Method": result["feature_selection_method"], "Feature": feature, })
             for candidate in result["candidate_scores"]:
-                candidates.append({
-                    "Model": model_name, "Fold": fold,
-                    "Candidate": str(candidate["candidate_values"]),
-                    "Best_inner_score": candidate["best_inner_score"],
-                })
-            members.append({
-                "pipeline": result["model"], "thresholds": result["best_thresholds"],
-                "quantiles": result["best_threshold_quantiles"],
-            })
+                candidates.append({ "Model": model_name, "Fold": fold, "Candidate": str(candidate["candidate_values"]), "Best_inner_score": candidate["best_inner_score"], })
+            members.append({ "pipeline": result["model"], "thresholds": result["best_thresholds"], "quantiles": result["best_threshold_quantiles"], })
         models_dict[model_name] = EnsembleModel(members, labels)
-    results = _build_result_tables(
-        models_dict, predictions, params, selected, candidates, fold_rows,
-        n_classes, optimize_metric
-    )
+    results = _build_result_tables( models_dict, predictions, params, selected, candidates, fold_rows, n_classes, optimize_metric )
     results["split_manifest"] = pd.DataFrame(split_manifest)
     results["split_assignments"] = pd.DataFrame(split_assignments)
     results["configuration_labels"] = labels
@@ -1328,10 +1040,7 @@ Starting {model_name}")
         mean_probabilities = member_probabilities.mean(axis=0)
         std_probabilities = member_probabilities.std(axis=0)
         predictions_full = mean_probabilities.argmax(axis=1)
-        member_true_classes = np.column_stack([
-            classes_from_thresholds(y, member["thresholds"]).to_numpy()
-            for member in ensemble.members
-        ])
+        member_true_classes = np.column_stack([ classes_from_thresholds(y, member["thresholds"]).to_numpy() for member in ensemble.members ])
         true_full = np.apply_along_axis(_majority_vote, 1, member_true_classes)
         for sample_id in range(len(X)):
             row = {
@@ -1354,10 +1063,7 @@ Starting {model_name}")
     return results
 
 ### 7. Result aggregation and Excel export ###
-def _build_result_tables(
-    models_dict, predictions, params, selected, candidates, folds,
-    n_classes, optimize_metric
-):
+def _build_result_tables( models_dict, predictions, params, selected, candidates, folds, n_classes, optimize_metric ):
     df_predictions_all = pd.DataFrame(predictions)
     df_params = pd.DataFrame(params)
     df_folds = pd.DataFrame(folds)
@@ -1373,18 +1079,12 @@ def _build_result_tables(
     nested_sort_column = f"Mean_{optimize_metric}_CV"
     if nested_sort_column not in pd.DataFrame(nested_rows).columns:
         raise KeyError(f"Optimization metric is unavailable in summary: {optimize_metric}")
-    df_summary_nested = pd.DataFrame(nested_rows).sort_values(
-        nested_sort_column, ascending=False
-    )
+    df_summary_nested = pd.DataFrame(nested_rows).sort_values( nested_sort_column, ascending=False )
     df_summary_nested.insert(1, "Model_selection_metric", optimize_metric)
     labels = class_labels(n_classes)
     mean_rows = []
     for (model_name, sample_id), subset in df_predictions_all.groupby(["Model", "Sample_ID"]):
-        row = {
-            "Model": model_name, "Sample_ID": sample_id,
-            "Target": subset["Target"].mean(),
-            "True_encoded": _majority_vote(subset["True_encoded"]),
-        }
+        row = { "Model": model_name, "Sample_ID": sample_id, "Target": subset["Target"].mean(), "True_encoded": _majority_vote(subset["True_encoded"]), }
         probabilities = np.asarray([subset[f"Prob_{label}"].mean() for label in labels])
         row["Predicted_encoded"] = int(np.argmax(probabilities))
         row["True_label"] = labels[row["True_encoded"]]
@@ -1397,18 +1097,13 @@ def _build_result_tables(
     summary_mean_rows = []
     for model_name, subset in df_predictions_mean.groupby("Model"):
         probability_columns = [f"Prob_{label}" for label in labels]
-        metrics = evaluate_classification(
-            subset["True_encoded"], subset["Predicted_encoded"],
-            subset[probability_columns].to_numpy(), n_classes
-        )
+        metrics = evaluate_classification( subset["True_encoded"], subset["Predicted_encoded"], subset[probability_columns].to_numpy(), n_classes )
         summary_mean_rows.append({"Model": model_name, **{f"{key}_mean_prediction": value for key, value in metrics.items()}})
     mean_sort_column = f"{optimize_metric}_mean_prediction"
     df_summary_mean = pd.DataFrame(summary_mean_rows)
     if mean_sort_column not in df_summary_mean.columns:
         raise KeyError(f"Optimization metric is unavailable in mean summary: {optimize_metric}")
-    df_summary_mean = df_summary_mean.sort_values(
-        mean_sort_column, ascending=False
-    )
+    df_summary_mean = df_summary_mean.sort_values( mean_sort_column, ascending=False )
     df_summary_mean.insert(1, "Model_selection_metric", optimize_metric)
     train_columns = [column for column in df_params.columns if column.startswith("train_")]
     test_columns = [column for column in df_params.columns if column.startswith("test_")]
@@ -1420,9 +1115,7 @@ def _build_result_tables(
         feature_frequency = pd.DataFrame()
         feature_frequency_by_selector = pd.DataFrame()
     else:
-        feature_frequency = (df_selected.groupby(["Model", "Feature"]).size()
-                             .reset_index(name="Count")
-                             .sort_values(["Model", "Count"], ascending=[True, False]))
+        feature_frequency = (df_selected.groupby(["Model", "Feature"]).size() .reset_index(name="Count") .sort_values(["Model", "Count"], ascending=[True, False]))
         feature_frequency["Selection_Frequency"] = feature_frequency["Count"] / n_folds
         feature_frequency_by_selector = (
             df_selected.groupby(["Model", "Feature_Selection_Method", "Feature"]).size()
@@ -1430,8 +1123,7 @@ def _build_result_tables(
             .sort_values(["Model", "Feature_Selection_Method", "Count"], ascending=[True, True, False])
         )
         feature_frequency_by_selector["Selection_Frequency"] = feature_frequency_by_selector["Count"] / n_folds
-    selector_frequency = (df_params.groupby(["Model", "Feature_Selection_Method"]).size()
-                          .reset_index(name="Count"))
+    selector_frequency = (df_params.groupby(["Model", "Feature_Selection_Method"]).size() .reset_index(name="Count"))
     selector_frequency["Selection_Method_Frequency"] = selector_frequency["Count"] / n_folds
     representative_features = {}
     if not feature_frequency.empty:
@@ -1440,11 +1132,7 @@ def _build_result_tables(
                 feature_frequency[feature_frequency["Model"] == model_name]
                 .sort_values(["Count", "Feature"], ascending=[False, True])["Feature"].tolist()
             )
-    threshold_columns = [
-        column for column in [
-            "Model", "Fold", "Thresholds", "Threshold_quantiles", "Best_inner_score"
-        ] if column in df_params.columns
-    ]
+    threshold_columns = [ column for column in [ "Model", "Fold", "Thresholds", "Threshold_quantiles", "Best_inner_score" ] if column in df_params.columns ]
     threshold_summary = df_params[threshold_columns].copy()
 
     return {
@@ -1479,12 +1167,7 @@ def _configuration_to_dataframe(configuration: dict[str, Any] | None) -> pd.Data
 
     return pd.DataFrame(rows)
 
-def export_workflow_results(
-    results: dict[str, Any],
-    output_file: str | Path,
-    save_excel: bool = True,
-    configuration: dict[str, Any] | None = None,
-) -> Path | None:
+def export_workflow_results( results: dict[str, Any], output_file: str | Path, save_excel: bool = True, configuration: dict[str, Any] | None = None, ) -> Path | None:
     """Export the complete workflow output to one Excel workbook."""
     if not save_excel:
         return None
@@ -1494,11 +1177,7 @@ def export_workflow_results(
 
     with pd.ExcelWriter(output_file) as writer:
         if configuration is not None:
-            _configuration_to_dataframe(configuration).to_excel(
-                writer,
-                sheet_name="Configuration",
-                index=False,
-            )
+            _configuration_to_dataframe(configuration).to_excel( writer, sheet_name="Configuration", index=False, )
 
         sheet_map = {
             "summary_nested": "Summary_all_predictions",
@@ -1521,34 +1200,21 @@ def export_workflow_results(
         for result_key, sheet_name in sheet_map.items():
             dataframe = results.get(result_key)
             if isinstance(dataframe, pd.DataFrame):
-                dataframe.to_excel(
-                    writer,
-                    sheet_name=sheet_name,
-                    index=False,
-                )
+                dataframe.to_excel( writer, sheet_name=sheet_name, index=False, )
 
     return output_file
 
 
 ### 8. General plotting utilities ###
 
-def _finish_figure(
-    output_path: str | Path | None,
-    save_figures: bool,
-    show_figures: bool,
-    plot_settings: dict[str, Any] | None = None,
-):
+def _finish_figure( output_path: str | Path | None, save_figures: bool, show_figures: bool, plot_settings: dict[str, Any] | None = None, ):
     """Save, display and close the current Matplotlib figure."""
     settings = _resolve_plot_settings(plot_settings)
 
     if save_figures and output_path is not None:
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(
-            output_path,
-            dpi=settings["dpi"],
-            bbox_inches="tight",
-        )
+        plt.savefig( output_path, dpi=settings["dpi"], bbox_inches="tight", )
 
     if show_figures:
         plt.show()
@@ -1585,9 +1251,7 @@ DEFAULT_PLOT_SETTINGS = {
     "point_edge_width": 1.0,
 }
 
-def _resolve_plot_settings(
-    plot_settings: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+def _resolve_plot_settings( plot_settings: dict[str, Any] | None = None, ) -> dict[str, Any]:
     settings = DEFAULT_PLOT_SETTINGS.copy()
     if plot_settings:
         unknown = sorted(set(plot_settings) - set(settings))
@@ -1602,13 +1266,7 @@ def _style_axes(settings: dict[str, Any]):
     if settings["show_grid"]:
         plt.grid(alpha=settings["grid_alpha"])
 
-def _annotate_bar_values(
-    bars,
-    values=None,
-    horizontal: bool = False,
-    fmt: str = ".1f",
-    fontsize: float | None = None,
-):
+def _annotate_bar_values( bars, values=None, horizontal: bool = False, fmt: str = ".1f", fontsize: float | None = None, ):
     bars = list(bars)
     if values is None:
         values = [bar.get_width() if horizontal else bar.get_height() for bar in bars]
@@ -1624,14 +1282,7 @@ def _annotate_bar_values(
             x_position = bar.get_x() + bar.get_width() / 2
             y_position = bar.get_y() + bar.get_height() / 2
 
-        plt.text(
-            x_position,
-            y_position,
-            format(float(value), fmt),
-            ha="center",
-            va="center",
-            fontsize=fontsize,
-        )
+        plt.text( x_position, y_position, format(float(value), fmt), ha="center", va="center", fontsize=fontsize, )
 
 
 ### 9. Model and split diagnostic plots ###
@@ -1649,25 +1300,10 @@ def plot_correlation_heatmap(
     settings = _resolve_plot_settings(plot_settings)
     plt.figure(figsize=figure_size)
     matrix = X.corr()
-    image = plt.imshow(
-        matrix,
-        aspect="auto",
-        vmin=-1,
-        vmax=1,
-        cmap="coolwarm",
-    )
+    image = plt.imshow( matrix, aspect="auto", vmin=-1, vmax=1, cmap="coolwarm", )
     plt.colorbar(image, label="Pearson correlation")
-    plt.xticks(
-        range(len(matrix.columns)),
-        matrix.columns,
-        rotation=90,
-        fontsize=max(4, settings["tick_size"] - 2),
-    )
-    plt.yticks(
-        range(len(matrix.index)),
-        matrix.index,
-        fontsize=max(4, settings["tick_size"] - 2),
-    )
+    plt.xticks( range(len(matrix.columns)), matrix.columns, rotation=90, fontsize=max(4, settings["tick_size"] - 2), )
+    plt.yticks( range(len(matrix.index)), matrix.index, fontsize=max(4, settings["tick_size"] - 2), )
     plt.title("Feature correlation matrix", fontsize=settings["title_size"])
     plt.tight_layout()
 
@@ -1696,19 +1332,9 @@ def plot_target_distribution(
         raise ValueError("No finite target values are available for plotting.")
 
     plt.figure(figsize=settings["bar_figure_size"])
-    plt.hist(
-        y_values,
-        bins=bins,
-        color=settings["bar_color"],
-        edgecolor=settings["bar_edge_color"],
-        linewidth=settings["bar_edge_width"],
-        density=density,
-    )
+    plt.hist( y_values, bins=bins, color=settings["bar_color"], edgecolor=settings["bar_edge_color"], linewidth=settings["bar_edge_width"], density=density, )
     plt.xlabel(target_label, fontsize=settings["label_size"])
-    plt.ylabel(
-        "Density" if density else "Frequency",
-        fontsize=settings["label_size"],
-    )
+    plt.ylabel( "Density" if density else "Frequency", fontsize=settings["label_size"], )
     _style_axes(settings)
     plt.tight_layout()
 
@@ -1741,22 +1367,14 @@ def plot_target_split_distribution(
     """
     settings = _resolve_plot_settings(plot_settings)
     y_full = np.asarray(list(y), dtype=float)
-    selected_fold = split_assignments[
-        split_assignments["Fold"] == int(fold)
-    ].copy()
+    selected_fold = split_assignments[ split_assignments["Fold"] == int(fold) ].copy()
 
     if selected_fold.empty:
         available = sorted(split_assignments["Fold"].unique().tolist())
-        raise ValueError(
-            f"Fold {fold} was not found. Available outer folds: {available}"
-        )
+        raise ValueError( f"Fold {fold} was not found. Available outer folds: {available}" )
 
-    y_training = selected_fold.loc[
-        selected_fold["Set"] == "Training", "Target"
-    ].to_numpy(dtype=float)
-    y_validation = selected_fold.loc[
-        selected_fold["Set"] == "Validation", "Target"
-    ].to_numpy(dtype=float)
+    y_training = selected_fold.loc[ selected_fold["Set"] == "Training", "Target" ].to_numpy(dtype=float)
+    y_validation = selected_fold.loc[ selected_fold["Set"] == "Validation", "Target" ].to_numpy(dtype=float)
 
     values_for_bins = [y_full, y_training, y_validation]
     y_external = None
@@ -1818,22 +1436,14 @@ def plot_target_split_distribution(
         )
 
     plt.xlabel(target_label, fontsize=settings["label_size"])
-    plt.ylabel(
-        "Density" if density else "Frequency",
-        fontsize=settings["label_size"],
-    )
-    plt.title(
-        f"Target distribution across dataset subsets: outer fold {fold}",
-        fontsize=settings["title_size"],
-    )
+    plt.ylabel( "Density" if density else "Frequency", fontsize=settings["label_size"], )
+    plt.title( f"Target distribution across dataset subsets: outer fold {fold}", fontsize=settings["title_size"], )
     plt.legend(loc="upper right", fontsize=settings["legend_size"])
     _style_axes(settings)
     plt.tight_layout()
 
     extension = settings["file_format"]
-    path = Path(results_dir) / (
-        f"target_split_distribution_fold_{fold}_{output_prefix}.{extension}"
-    )
+    path = Path(results_dir) / ( f"target_split_distribution_fold_{fold}_{output_prefix}.{extension}" )
     _finish_figure(path, save_figures, show_figures, settings)
     return path
 
@@ -1849,69 +1459,30 @@ def plot_model_metric_comparison(
     """Compare model families using averaged OOF classification metrics."""
     settings = _resolve_plot_settings(plot_settings)
     metric = metric.lower()
-    allowed_metrics = {
-        "accuracy",
-        "balanced_accuracy",
-        "f1_macro",
-        "mcc",
-        "roc_auc",
-    }
+    allowed_metrics = { "accuracy", "balanced_accuracy", "f1_macro", "mcc", "roc_auc", }
     if metric not in allowed_metrics:
-        raise ValueError(
-            "metric must be one of: accuracy, balanced_accuracy, "
-            "f1_macro, mcc, roc_auc."
-        )
+        raise ValueError( "metric must be one of: accuracy, balanced_accuracy, " "f1_macro, mcc, roc_auc." )
 
     metric_column = f"{metric}_mean_prediction"
     if metric_column not in results["summary_mean"].columns:
-        raise KeyError(
-            f"Metric column '{metric_column}' is not available."
-        )
-    summary = results["summary_mean"].sort_values(
-        metric_column,
-        ascending=False,
-    )
+        raise KeyError( f"Metric column '{metric_column}' is not available." )
+    summary = results["summary_mean"].sort_values( metric_column, ascending=False, )
 
     plt.figure(figsize=settings["bar_figure_size"])
-    bars = plt.bar(
-        summary["Model"],
-        summary[metric_column],
-        color=settings["bar_color"],
-        edgecolor=settings["bar_edge_color"],
-        linewidth=settings["bar_edge_width"],
-    )
+    bars = plt.bar( summary["Model"], summary[metric_column], color=settings["bar_color"], edgecolor=settings["bar_edge_color"], linewidth=settings["bar_edge_width"], )
     metric_label = metric.replace("_", " ").title()
     plt.ylabel(f"OOF {metric_label}", fontsize=settings["label_size"])
     plt.xlabel("Model", fontsize=settings["label_size"])
-    plt.title(
-        f"Model comparison: OOF {metric_label}",
-        fontsize=settings["title_size"],
-    )
-    plt.xticks(
-        rotation=45,
-        ha="right",
-        fontsize=settings["tick_size"],
-    )
+    plt.title( f"Model comparison: OOF {metric_label}", fontsize=settings["title_size"], )
+    plt.xticks( rotation=45, ha="right", fontsize=settings["tick_size"], )
 
-    _annotate_bar_values(
-        bars,
-        summary[metric_column],
-        fmt=".2f",
-        fontsize=settings["tick_size"],
-    )
+    _annotate_bar_values( bars, summary[metric_column], fmt=".2f", fontsize=settings["tick_size"], )
 
     _style_axes(settings)
     plt.tight_layout()
     extension = settings["file_format"]
-    path = Path(results_dir) / (
-        f"model_comparison_{metric}_{output_prefix}.{extension}"
-    )
-    _finish_figure(
-        path,
-        save_figures,
-        show_figures,
-        plot_settings=settings,
-    )
+    path = Path(results_dir) / ( f"model_comparison_{metric}_{output_prefix}.{extension}" )
+    _finish_figure( path, save_figures, show_figures, plot_settings=settings, )
     return path
 
 def plot_overfitting_gap(
@@ -1926,61 +1497,28 @@ def plot_overfitting_gap(
     """Plot the mean outer-fold training-to-test performance gap."""
     settings = _resolve_plot_settings(plot_settings)
     metric = metric.lower()
-    allowed_metrics = {
-        "accuracy",
-        "balanced_accuracy",
-        "f1_macro",
-        "mcc",
-        "roc_auc",
-    }
+    allowed_metrics = { "accuracy", "balanced_accuracy", "f1_macro", "mcc", "roc_auc", }
     if metric not in allowed_metrics:
-        raise ValueError(
-            "metric must be one of: accuracy, balanced_accuracy, "
-            "f1_macro, mcc, roc_auc."
-        )
+        raise ValueError( "metric must be one of: accuracy, balanced_accuracy, " "f1_macro, mcc, roc_auc." )
 
     train_column = f"train_{metric}"
     test_column = f"test_{metric}"
     train = results["train_mean"][["Model", train_column]]
     test = results["test_mean"][["Model", test_column]]
     comparison = train.merge(test, on="Model", how="inner")
-    comparison["Metric_gap"] = (
-        comparison[train_column] - comparison[test_column]
-    )
+    comparison["Metric_gap"] = ( comparison[train_column] - comparison[test_column] )
     comparison = comparison.sort_values("Metric_gap", ascending=False)
 
     plt.figure(figsize=settings["bar_figure_size"])
-    bars = plt.bar(
-        comparison["Model"],
-        comparison["Metric_gap"],
-        color=settings["bar_color"],
-        edgecolor=settings["bar_edge_color"],
-        linewidth=settings["bar_edge_width"],
-    )
-    plt.axhline(
-        0,
-        linewidth=settings["line_width"],
-        color=settings["reference_line_color"],
-    )
+    bars = plt.bar( comparison["Model"], comparison["Metric_gap"], color=settings["bar_color"], edgecolor=settings["bar_edge_color"], linewidth=settings["bar_edge_width"], )
+    plt.axhline( 0, linewidth=settings["line_width"], color=settings["reference_line_color"], )
     metric_label = metric.replace("_", " ").title()
-    plt.ylabel(
-        f"Training-to-test degradation in {metric_label}",
-        fontsize=settings["label_size"],
-    )
+    plt.ylabel( f"Training-to-test degradation in {metric_label}", fontsize=settings["label_size"], )
     plt.xlabel("Model", fontsize=settings["label_size"])
     plt.title("Train–test performance gap", fontsize=settings["title_size"])
-    plt.xticks(
-        rotation=45,
-        ha="right",
-        fontsize=settings["tick_size"],
-    )
+    plt.xticks( rotation=45, ha="right", fontsize=settings["tick_size"], )
 
-    _annotate_bar_values(
-        bars,
-        comparison["Metric_gap"],
-        fmt=".2f",
-        fontsize=settings["tick_size"],
-    )
+    _annotate_bar_values( bars, comparison["Metric_gap"], fmt=".2f", fontsize=settings["tick_size"], )
 
     _style_axes(settings)
     plt.tight_layout()
@@ -2004,25 +1542,12 @@ def plot_selector_frequency(
     if dataframe.empty:
         return None
 
-    pivot = dataframe.pivot(
-        index="Model",
-        columns="Feature_Selection_Method",
-        values="Selection_Method_Frequency",
-    ).fillna(0)
+    pivot = dataframe.pivot( index="Model", columns="Feature_Selection_Method", values="Selection_Method_Frequency", ).fillna(0)
 
-    axis = pivot.plot(
-        kind="bar",
-        figsize=settings["bar_figure_size"],
-        color=None,
-        edgecolor=settings["bar_edge_color"],
-        linewidth=settings["bar_edge_width"],
-    )
+    axis = pivot.plot( kind="bar", figsize=settings["bar_figure_size"], color=None, edgecolor=settings["bar_edge_color"], linewidth=settings["bar_edge_width"], )
     axis.set_ylabel("Selection frequency", fontsize=settings["label_size"])
     axis.set_xlabel("Model", fontsize=settings["label_size"])
-    axis.set_title(
-        "Feature-selection method frequency",
-        fontsize=settings["title_size"],
-    )
+    axis.set_title( "Feature-selection method frequency", fontsize=settings["title_size"], )
     axis.legend(title="Selector", loc="upper right", fontsize=settings["legend_size"])
 
     plt.xticks(rotation=45, ha="right", fontsize=settings["tick_size"])
@@ -2051,11 +1576,7 @@ def plot_feature_frequency(
 
     paths = []
     for model_name in dataframe["Model"].unique():
-        subset = (
-            dataframe[dataframe["Model"] == model_name]
-            .nlargest(top_n, "Selection_Frequency")
-            .sort_values("Selection_Frequency")
-        )
+        subset = ( dataframe[dataframe["Model"] == model_name] .nlargest(top_n, "Selection_Frequency") .sort_values("Selection_Frequency") )
 
         figure_height = max(3.0, 0.28 * len(subset))
         plt.figure(figsize=(settings["bar_figure_size"][0], figure_height))
@@ -2068,25 +1589,14 @@ def plot_feature_frequency(
         )
         plt.xlabel("Selection frequency", fontsize=settings["label_size"])
         plt.ylabel("Feature", fontsize=settings["label_size"])
-        plt.title(
-            f"Top selected features: {model_name}",
-            fontsize=settings["title_size"],
-        )
+        plt.title( f"Top selected features: {model_name}", fontsize=settings["title_size"], )
         plt.xlim(0, 1)
-        _annotate_bar_values(
-            bars,
-            subset["Selection_Frequency"],
-            horizontal=True,
-            fmt=".2f",
-            fontsize=settings["tick_size"],
-        )
+        _annotate_bar_values( bars, subset["Selection_Frequency"], horizontal=True, fmt=".2f", fontsize=settings["tick_size"], )
         _style_axes(settings)
         plt.tight_layout()
 
         extension = settings["file_format"]
-        path = Path(results_dir) / (
-            f"feature_frequency_{model_name}_{output_prefix}.{extension}"
-        )
+        path = Path(results_dir) / ( f"feature_frequency_{model_name}_{output_prefix}.{extension}" )
         _finish_figure(path, save_figures, show_figures, settings)
         paths.append(path)
 
@@ -2108,18 +1618,12 @@ def plot_model_prediction_comparison(
     probability_column = f"Prob_{highest_class}"
     predictions = results["predictions_mean"]
 
-    x_values = predictions[predictions["Model"] == model_x][
-        ["Sample_ID", probability_column]
-    ].rename(columns={probability_column: f"Probability_{model_x}"})
-    y_values = predictions[predictions["Model"] == model_y][
-        ["Sample_ID", probability_column]
-    ].rename(columns={probability_column: f"Probability_{model_y}"})
+    x_values = predictions[predictions["Model"] == model_x][ ["Sample_ID", probability_column] ].rename(columns={probability_column: f"Probability_{model_x}"})
+    y_values = predictions[predictions["Model"] == model_y][ ["Sample_ID", probability_column] ].rename(columns={probability_column: f"Probability_{model_y}"})
 
     merged = x_values.merge(y_values, on="Sample_ID", how="inner")
     if merged.empty:
-        raise ValueError(
-            f"No common predictions found for {model_x} and {model_y}."
-        )
+        raise ValueError( f"No common predictions found for {model_x} and {model_y}." )
 
     x_column = f"Probability_{model_x}"
     y_column = f"Probability_{model_y}"
@@ -2134,24 +1638,10 @@ def plot_model_prediction_comparison(
         edgecolor=settings["point_edge_color"],
         linewidth=settings["point_edge_width"],
     )
-    plt.plot(
-        [0, 1],
-        [0, 1],
-        linewidth=settings["line_width"],
-        color=settings["reference_line_color"],
-    )
-    plt.xlabel(
-        f"{model_x} OOF probability: {highest_class}",
-        fontsize=settings["label_size"],
-    )
-    plt.ylabel(
-        f"{model_y} OOF probability: {highest_class}",
-        fontsize=settings["label_size"],
-    )
-    plt.title(
-        f"{model_x} vs {model_y}",
-        fontsize=settings["title_size"],
-    )
+    plt.plot( [0, 1], [0, 1], linewidth=settings["line_width"], color=settings["reference_line_color"], )
+    plt.xlabel( f"{model_x} OOF probability: {highest_class}", fontsize=settings["label_size"], )
+    plt.ylabel( f"{model_y} OOF probability: {highest_class}", fontsize=settings["label_size"], )
+    plt.title( f"{model_x} vs {model_y}", fontsize=settings["title_size"], )
     plt.xlim(0, 1)
     plt.ylim(0, 1)
     if settings["equal_aspect"]:
@@ -2160,16 +1650,12 @@ def plot_model_prediction_comparison(
     plt.tight_layout()
 
     extension = settings["file_format"]
-    path = Path(results_dir) / (
-        f"model_prediction_comparison_{model_x}_vs_{model_y}_"
-        f"{output_prefix}.{extension}"
-    )
+    path = Path(results_dir) / ( f"model_prediction_comparison_{model_x}_vs_{model_y}_" f"{output_prefix}.{extension}" )
     _finish_figure(path, save_figures, show_figures, settings)
     return path
 
 
-def plot_threshold_distribution(results, results_dir, output_prefix, save_figures=True,
-                                show_figures=True, plot_settings=None):
+def plot_threshold_distribution(results, results_dir, output_prefix, save_figures=True, show_figures=True, plot_settings=None):
     settings=_resolve_plot_settings(plot_settings); rows=[]
     for _,r in results["params"].iterrows():
         for i,t in enumerate(str(r["Thresholds"]).split(","),1):
@@ -2182,8 +1668,7 @@ def plot_threshold_distribution(results, results_dir, output_prefix, save_figure
     _finish_figure(path,save_figures,show_figures,settings); return path
 
 
-def plot_confusion_matrices(results, results_dir, output_prefix, normalize=True,
-                            save_figures=True, show_figures=True, plot_settings=None):
+def plot_confusion_matrices(results, results_dir, output_prefix, normalize=True, save_figures=True, show_figures=True, plot_settings=None):
     settings=_resolve_plot_settings(plot_settings); paths=[]; labels=results["configuration_labels"]
     for model in results["predictions_all"]["Model"].unique():
         df=results["predictions_all"][results["predictions_all"]["Model"]==model]
@@ -2205,14 +1690,9 @@ def plot_confusion_matrices(results, results_dir, output_prefix, normalize=True,
     return paths
 
 ### 10. External-test and virtual-screening utilities ###
-def evaluate_external_dataset(
-    df_external, training_columns, models_dict, target_column, id_columns=None,
-    drop_columns=None, model_names=None, include_prediction_std=True,
-):
+def evaluate_external_dataset( df_external, training_columns, models_dict, target_column, id_columns=None, drop_columns=None, model_names=None, include_prediction_std=True, ):
     """Predict external or screening data with full-training ensemble members."""
-    X_external = prepare_external_features(
-        df_external, training_columns, target_column, id_columns, drop_columns
-    )
+    X_external = prepare_external_features( df_external, training_columns, target_column, id_columns, drop_columns )
     model_names = model_names or list(models_dict)
     output = df_external.reset_index(drop=True).copy()
     metrics_rows = []
@@ -2233,36 +1713,23 @@ def evaluate_external_dataset(
         if include_prediction_std:
             output[f"Prediction_STD_{model_name}"] = std_probabilities.max(axis=1)
         if has_target:
-            true_members = np.column_stack([
-                classes_from_thresholds(y_cont_external, member["thresholds"]).to_numpy()
-                for member in ensemble.members
-            ])
+            true_members = np.column_stack([ classes_from_thresholds(y_cont_external, member["thresholds"]).to_numpy() for member in ensemble.members ])
             true_classes = np.apply_along_axis(_majority_vote, 1, true_members)
             output[f"True_encoded_{model_name}"] = true_classes
             output[f"True_label_{model_name}"] = [ensemble.class_names[index] for index in true_classes]
             metrics = evaluate_classification(true_classes, predicted, mean_probabilities, len(ensemble.class_names))
-            metrics_rows.append({
-                "Model": model_name, "N_Ensemble_Members": len(ensemble.members),
-                **{f"{key}_external": value for key, value in metrics.items()},
-            })
+            metrics_rows.append({ "Model": model_name, "N_Ensemble_Members": len(ensemble.members), **{f"{key}_external": value for key, value in metrics.items()}, })
     return output, pd.DataFrame(metrics_rows)
 
 
-def combine_training_and_external_predictions(
-    results: dict[str, Any],
-    external_results: pd.DataFrame,
-    target_column: str,
-    model_names: list[str] | None = None,
-) -> pd.DataFrame:
+def combine_training_and_external_predictions( results: dict[str, Any], external_results: pd.DataFrame, target_column: str, model_names: list[str] | None = None, ) -> pd.DataFrame:
     """Combine mean OOF training and external classification predictions."""
     model_names = model_names or list(results["models_dict"])
     combined_rows = []
 
     training_predictions = results["predictions_mean"]
     for model_name in model_names:
-        training_model = training_predictions[
-            training_predictions["Model"] == model_name
-        ].copy()
+        training_model = training_predictions[ training_predictions["Model"] == model_name ].copy()
 
         for _, row in training_model.iterrows():
             combined_rows.append(
@@ -2283,11 +1750,7 @@ def combine_training_and_external_predictions(
         std_column = f"Prediction_STD_{model_name}"
 
         for external_index, external_row in external_results.iterrows():
-            true_value = (
-                external_row[true_column]
-                if true_column in external_results.columns
-                else np.nan
-            )
+            true_value = ( external_row[true_column] if true_column in external_results.columns else np.nan )
             predicted_value = external_row[prediction_column]
             combined_rows.append(
                 {
@@ -2331,22 +1794,10 @@ def save_external_results(
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
     with pd.ExcelWriter(output_file) as writer:
-        detailed_results.to_excel(
-            writer,
-            sheet_name="External_predictions",
-            index=False,
-        )
-        metrics.to_excel(
-            writer,
-            sheet_name="External_metrics",
-            index=False,
-        )
+        detailed_results.to_excel( writer, sheet_name="External_predictions", index=False, )
+        metrics.to_excel( writer, sheet_name="External_metrics", index=False, )
         if combined_training_external is not None:
-            combined_training_external.to_excel(
-                writer,
-                sheet_name="Training_OOF_and_external",
-                index=False,
-            )
+            combined_training_external.to_excel( writer, sheet_name="Training_OOF_and_external", index=False, )
 
     return output_file
 
@@ -2372,68 +1823,28 @@ def plot_external_confusion_matrice(
         true_column = f"True_encoded_{model_name}"
         predicted_column = f"Predicted_encoded_{model_name}"
 
-        missing_columns = [
-            column
-            for column in [true_column, predicted_column]
-            if column not in external_results.columns
-        ]
+        missing_columns = [ column for column in [true_column, predicted_column] if column not in external_results.columns ]
         if missing_columns:
-            raise KeyError(
-                "External prediction columns were not found: "
-                f"{missing_columns}"
-            )
+            raise KeyError( "External prediction columns were not found: " f"{missing_columns}" )
 
         y_true = external_results[true_column].astype(int)
         y_predicted = external_results[predicted_column].astype(int)
 
-        matrix = confusion_matrix(
-            y_true,
-            y_predicted,
-            labels=range(len(labels)),
-            normalize="true" if normalize else None,
-        )
+        matrix = confusion_matrix( y_true, y_predicted, labels=range(len(labels)), normalize="true" if normalize else None, )
 
         plt.figure(figsize=settings["parity_figure_size"])
-        image = plt.imshow(
-            matrix,
-            cmap="Blues",
-            vmin=0,
-            vmax=1 if normalize else None,
-        )
+        image = plt.imshow( matrix, cmap="Blues", vmin=0, vmax=1 if normalize else None, )
         plt.colorbar(image)
 
-        plt.xticks(
-            range(len(labels)),
-            labels,
-            rotation=45,
-            ha="right",
-            fontsize=settings["tick_size"],
-        )
-        plt.yticks(
-            range(len(labels)),
-            labels,
-            fontsize=settings["tick_size"],
-        )
+        plt.xticks( range(len(labels)), labels, rotation=45, ha="right", fontsize=settings["tick_size"], )
+        plt.yticks( range(len(labels)), labels, fontsize=settings["tick_size"], )
 
-        plt.xlabel(
-            "Predicted class",
-            fontsize=settings["label_size"],
-        )
-        plt.ylabel(
-            "Observed class",
-            fontsize=settings["label_size"],
-        )
-        plt.title(
-            f"{external_label}: {model_name}",
-            fontsize=settings["title_size"],
-        )
+        plt.xlabel( "Predicted class", fontsize=settings["label_size"], )
+        plt.ylabel( "Observed class", fontsize=settings["label_size"], )
+        plt.title( f"{external_label}: {model_name}", fontsize=settings["title_size"], )
 
         number_format = ".2f" if normalize else "d"
-        threshold = (
-            np.nanmax(matrix) / 2
-            if matrix.size and np.nanmax(matrix) > 0
-            else 0
-        )
+        threshold = ( np.nanmax(matrix) / 2 if matrix.size and np.nanmax(matrix) > 0 else 0 )
 
         for row_index in range(matrix.shape[0]):
             for column_index in range(matrix.shape[1]):
@@ -2456,17 +1867,9 @@ def plot_external_confusion_matrice(
         plt.tight_layout()
 
         extension = settings["file_format"]
-        path = Path(results_dir) / (
-            f"external_confusion_matrix_"
-            f"{model_name}_{output_prefix}.{extension}"
-        )
+        path = Path(results_dir) / ( f"external_confusion_matrix_" f"{model_name}_{output_prefix}.{extension}" )
 
-        _finish_figure(
-            path,
-            save_figures,
-            show_figures,
-            settings,
-        )
+        _finish_figure( path, save_figures, show_figures, settings, )
         paths.append(path)
 
     return paths
@@ -2489,6 +1892,17 @@ def plot_virtual_screening_distribution(y_training, screening_results, model_nam
         _finish_figure(path,save_figures,show_figures,settings); paths.append(path)
     return paths
 
+
+
+def _feature_class_threshold(x,y,target_threshold):
+    x=np.asarray(x,float); y=np.asarray(y,float); valid=np.isfinite(x)&np.isfinite(y); x=x[valid]; classes=(y[valid]>target_threshold).astype(int)
+    values=np.unique(x)
+    if len(values)<2 or len(np.unique(classes))<2: return np.nan
+    candidates=(values[:-1]+values[1:])/2; best=None
+    for threshold in candidates:
+        pred=(x>threshold).astype(int); score=max(np.mean(pred==classes),np.mean((1-pred)==classes)); candidate=(score,-abs(threshold-np.median(x)),threshold)
+        if best is None or candidate>best: best=candidate
+    return float(best[2])
 
 def plot_classification_feature_maps(
     X_training: pd.DataFrame,
@@ -2521,19 +1935,12 @@ def plot_classification_feature_maps(
     dataset_kind = dataset_kind.lower()
     allowed = {"oof", "full", "external", "screening"}
     if dataset_kind not in allowed:
-        raise ValueError(
-            "dataset_kind must be 'oof', 'full', 'external', or 'screening'."
-        )
+        raise ValueError( "dataset_kind must be 'oof', 'full', 'external', or 'screening'." )
 
     y_training = pd.Series(y_training).reset_index(drop=True).astype(float)
     X_training = X_training.reset_index(drop=True)
     evaluated_results = evaluated_results.reset_index(drop=True)
-    default_labels = {
-        "oof": "OOF validation",
-        "full": "Full-training ensemble",
-        "external": "External test",
-        "screening": "Virtual screening",
-    }
+    default_labels = { "oof": "OOF validation", "full": "Full-training ensemble", "external": "External test", "screening": "Virtual screening", }
     dataset_label = dataset_label or default_labels[dataset_kind]
 
     paths: list[Path] = []
@@ -2546,20 +1953,14 @@ def plot_classification_feature_maps(
 
         ensemble = results[ensemble_key][model_name]
         highest_label = ensemble.class_names[-1]
-        evaluated_probability_column = (
-            f"Prob_{highest_label}"
-            if dataset_kind in {"oof", "full"}
-            else f"Prob_{highest_label}_{model_name}"
-        )
+        evaluated_probability_column = ( f"Prob_{highest_label}" if dataset_kind in {"oof", "full"} else f"Prob_{highest_label}_{model_name}" )
         if evaluated_probability_column not in evaluated_results.columns:
             raise KeyError(f"Missing probability column: {evaluated_probability_column}")
 
         if features:
             selected_features = list(dict.fromkeys(features))
         else:
-            selected_features = results.get("representative_features", {}).get(
-                model_name, []
-            )[:top_n_features]
+            selected_features = results.get("representative_features", {}).get( model_name, [] )[:top_n_features]
             if not selected_features:
                 selected_features = list(X_training.columns[:top_n_features])
 
@@ -2571,11 +1972,7 @@ def plot_classification_feature_maps(
         n_thresholds = max((len(v) for v in member_thresholds), default=0)
         threshold_medians = []
         for threshold_index in range(n_thresholds):
-            values = [
-                float(v[threshold_index])
-                for v in member_thresholds
-                if len(v) > threshold_index
-            ]
+            values = [ float(v[threshold_index]) for v in member_thresholds if len(v) > threshold_index ]
             if values:
                 threshold_medians.append(float(np.median(values)))
 
@@ -2583,21 +1980,15 @@ def plot_classification_feature_maps(
         training_probabilities = None
         if dataset_kind in {"external", "screening"} and not hide_training:
             full_predictions = results["predictions_full_ensemble"]
-            full_predictions = full_predictions[
-                full_predictions["Model"] == model_name
-            ].sort_values("Sample_ID")
+            full_predictions = full_predictions[ full_predictions["Model"] == model_name ].sort_values("Sample_ID")
             training_probabilities = np.full(len(X_training), np.nan, dtype=float)
             sample_ids = full_predictions["Sample_ID"].astype(int).to_numpy()
             valid_ids = (sample_ids >= 0) & (sample_ids < len(X_training))
-            training_probabilities[sample_ids[valid_ids]] = full_predictions.loc[
-                valid_ids, f"Prob_{highest_label}"
-            ].to_numpy(dtype=float)
+            training_probabilities[sample_ids[valid_ids]] = full_predictions.loc[ valid_ids, f"Prob_{highest_label}" ].to_numpy(dtype=float)
 
         for feature in selected_features:
             x_eval = pd.to_numeric(evaluated_results[feature], errors="coerce")
-            p_eval = pd.to_numeric(
-                evaluated_results[evaluated_probability_column], errors="coerce"
-            )
+            p_eval = pd.to_numeric( evaluated_results[evaluated_probability_column], errors="coerce" )
             valid_eval = x_eval.notna().to_numpy() & p_eval.notna().to_numpy()
 
             fig, axis = plt.subplots(figsize=settings["bar_figure_size"])
@@ -2605,11 +1996,7 @@ def plot_classification_feature_maps(
 
             if dataset_kind in {"external", "screening"} and training_probabilities is not None:
                 x_train = pd.to_numeric(X_training[feature], errors="coerce")
-                valid_train = (
-                    x_train.notna().to_numpy()
-                    & y_training.notna().to_numpy()
-                    & np.isfinite(training_probabilities)
-                )
+                valid_train = ( x_train.notna().to_numpy() & y_training.notna().to_numpy() & np.isfinite(training_probabilities) )
                 if valid_train.any():
                     mappable = axis.scatter(
                         x_train.to_numpy()[valid_train],
@@ -2629,17 +2016,11 @@ def plot_classification_feature_maps(
             if dataset_kind in {"oof", "full", "external"}:
                 observed_column = "Target" if dataset_kind in {"oof", "full"} else target_column
                 if observed_column not in evaluated_results.columns:
-                    raise KeyError(
-                        f"{dataset_label} plot requires {observed_column!r}."
-                    )
+                    raise KeyError( f"{dataset_label} plot requires {observed_column!r}." )
                 y_eval = pd.to_numeric(evaluated_results[observed_column], errors="coerce")
                 valid_eval &= y_eval.notna().to_numpy()
                 marker = "s" if dataset_kind in {"oof", "external"} else "o"
-                edgecolor = (
-                    settings["validation_color"] if dataset_kind == "oof"
-                    else settings["test_color"] if dataset_kind == "external"
-                    else settings["point_edge_color"]
-                )
+                edgecolor = ( settings["validation_color"] if dataset_kind == "oof" else settings["test_color"] if dataset_kind == "external" else settings["point_edge_color"] )
                 mappable = axis.scatter(
                     x_eval.to_numpy()[valid_eval],
                     y_eval.to_numpy()[valid_eval],
@@ -2654,10 +2035,7 @@ def plot_classification_feature_maps(
                     linewidth=max(1.2, settings["point_edge_width"]),
                     label=dataset_label,
                 )
-                y_for_limits = np.concatenate([
-                    y_training.to_numpy(dtype=float),
-                    y_eval.dropna().to_numpy(dtype=float),
-                ])
+                y_for_limits = np.concatenate([ y_training.to_numpy(dtype=float), y_eval.dropna().to_numpy(dtype=float), ])
             else:
                 y_range = float(y_training.max() - y_training.min())
                 baseline = float(y_training.min() - (0.08 * y_range if y_range else 1.0))
@@ -2673,9 +2051,7 @@ def plot_classification_feature_maps(
                     linewidth=max(1.5, settings["point_edge_width"]),
                     label=dataset_label,
                 )
-                y_for_limits = np.concatenate([
-                    y_training.to_numpy(dtype=float), np.asarray([baseline])
-                ])
+                y_for_limits = np.concatenate([ y_training.to_numpy(dtype=float), np.asarray([baseline]) ])
 
             for i, threshold in enumerate(threshold_medians, start=1):
                 axis.axhline(
@@ -2686,6 +2062,8 @@ def plot_classification_feature_maps(
                     alpha=0.8,
                     label=f"Median class threshold {i}" if i == 1 else None,
                 )
+                feature_threshold=_feature_class_threshold(X_training[feature],y_training,threshold)
+                if np.isfinite(feature_threshold): axis.axvline(feature_threshold,color=settings["reference_line_color"],linestyle=":",linewidth=settings["line_width"],alpha=0.8,label=f"Feature threshold {i} = {feature_threshold:.3g}" if i == 1 else None)
 
             finite_y = y_for_limits[np.isfinite(y_for_limits)]
             if len(finite_y):
@@ -2695,25 +2073,16 @@ def plot_classification_feature_maps(
 
             axis.set_xlabel(feature, fontsize=settings["label_size"])
             axis.set_ylabel(target_column, fontsize=settings["label_size"])
-            axis.set_title(
-                f"{dataset_label}: {feature} ({model_name})",
-                fontsize=settings["title_size"],
-            )
+            axis.set_title( f"{dataset_label}: {feature} ({model_name})", fontsize=settings["title_size"], )
             axis.tick_params(axis="both", labelsize=settings["tick_size"])
             axis.legend(loc="best", fontsize=settings["legend_size"], frameon=True)
 
             colorbar = fig.colorbar(mappable, ax=axis)
-            colorbar.set_label(
-                f"Predicted probability: {highest_label}",
-                fontsize=settings["label_size"],
-            )
+            colorbar.set_label( f"Predicted probability: {highest_label}", fontsize=settings["label_size"], )
             colorbar.ax.tick_params(labelsize=settings["tick_size"])
 
             fig.tight_layout()
-            path = Path(results_dir) / (
-                f"classification_feature_map_{dataset_kind}_{model_name}_"
-                f"{_safe_filename(feature)}_{output_prefix}.{settings['file_format']}"
-            )
+            path = Path(results_dir) / ( f"classification_feature_map_{dataset_kind}_{model_name}_" f"{_safe_filename(feature)}_{output_prefix}.{settings['file_format']}" )
             if save_figures:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 fig.savefig(path, dpi=settings["dpi"], bbox_inches="tight")
@@ -2727,9 +2096,7 @@ def plot_classification_feature_maps(
 
 ### 11. Ensemble SHAP interpretation ###
 
-def compute_ensemble_shap(ensemble_model, X_background, X_explain, model_name,
-                          dataset_labels=None, sample_ids=None, background_size=100,
-                          max_evals=None, random_state=42):
+def compute_ensemble_shap(ensemble_model, X_background, X_explain, model_name, dataset_labels=None, sample_ids=None, background_size=100, max_evals=None, random_state=42):
     """Explain the ensemble probability assigned to the highest ordered class."""
     try:
         import shap
@@ -2792,11 +2159,7 @@ def plot_ensemble_shap(
     paths.append(bar_path)
     return paths
 
-def save_ensemble_shap_results(
-    shap_results: dict[str, dict[str, Any]],
-    output_file: str | Path,
-    save_excel: bool = True,
-) -> Path | None:
+def save_ensemble_shap_results( shap_results: dict[str, dict[str, Any]], output_file: str | Path, save_excel: bool = True, ) -> Path | None:
     """Save ensemble SHAP values and global importance tables to Excel."""
     if not save_excel:
         return None
@@ -2805,26 +2168,14 @@ def save_ensemble_shap_results(
     with pd.ExcelWriter(output_file) as writer:
         for model_name, result in shap_results.items():
             safe_name = str(model_name)[:20]
-            result["values"].to_excel(
-                writer,
-                sheet_name=f"SHAP_{safe_name}"[:31],
-                index=False,
-            )
-            result["importance"].to_excel(
-                writer,
-                sheet_name=f"Importance_{safe_name}"[:31],
-                index=False,
-            )
+            result["values"].to_excel( writer, sheet_name=f"SHAP_{safe_name}"[:31], index=False, )
+            result["importance"].to_excel( writer, sheet_name=f"Importance_{safe_name}"[:31], index=False, )
     return output_file
 
 
 ### 12. Descriptor exploration plots ###
 
-def compute_feature_target_correlations(
-    X: pd.DataFrame,
-    y: pd.Series,
-    method: str = "pearson",
-) -> pd.DataFrame:
+def compute_feature_target_correlations( X: pd.DataFrame, y: pd.Series, method: str = "pearson", ) -> pd.DataFrame:
     """Compute univariate feature-target correlation, R2 and p-value."""
     method = method.lower()
     if method not in {"pearson", "spearman"}:
@@ -2848,12 +2199,7 @@ def compute_feature_target_correlations(
         })
     return pd.DataFrame(rows).sort_values("Abs_Correlation", ascending=False).reset_index(drop=True)
 
-def _resolve_feature_list(
-    X: pd.DataFrame,
-    features: list[str] | None,
-    correlations: pd.DataFrame | None = None,
-    top_n: int | None = None,
-) -> list[str]:
+def _resolve_feature_list( X: pd.DataFrame, features: list[str] | None, correlations: pd.DataFrame | None = None, top_n: int | None = None, ) -> list[str]:
     if features:
         missing = [f for f in features if f not in X.columns]
         if missing:
@@ -2903,24 +2249,12 @@ def plot_feature_target_correlations(
     subset=correlation_table.head(top_n).sort_values("Abs_Correlation")
     height=max(3.0,0.28*len(subset))
     plt.figure(figsize=(settings["bar_figure_size"][0],height))
-    bars = plt.barh(
-        subset["Feature"],
-        subset["Correlation"],
-        color=settings["bar_color"],
-        edgecolor=settings["bar_edge_color"],
-        linewidth=settings["bar_edge_width"],
-    )
+    bars = plt.barh( subset["Feature"], subset["Correlation"], color=settings["bar_color"], edgecolor=settings["bar_edge_color"], linewidth=settings["bar_edge_width"], )
     plt.axvline(0,color=settings["reference_line_color"],linewidth=settings["line_width"])
     plt.xlabel(f"{subset['Method'].iloc[0].capitalize()} correlation with target",fontsize=settings["label_size"])
     plt.ylabel("Feature",fontsize=settings["label_size"])
     plt.title("Univariate feature-target correlations",fontsize=settings["title_size"])
-    _annotate_bar_values(
-        bars,
-        subset["Correlation"],
-        horizontal=True,
-        fmt=".2f",
-        fontsize=settings["tick_size"],
-    )
+    _annotate_bar_values( bars, subset["Correlation"], horizontal=True, fmt=".2f", fontsize=settings["tick_size"], )
     _style_axes(settings); plt.tight_layout()
     path=Path(results_dir)/f"feature_target_correlations_{output_prefix}.{settings['file_format']}"
     _finish_figure(path,save_figures,show_figures,settings)
@@ -2940,11 +2274,7 @@ def plot_feature_target_scatter(
 ) -> list[Path]:
     """Plot one descriptor-versus-target scatter per selected feature."""
     settings = _resolve_plot_settings(plot_settings)
-    selected = (
-        _resolve_feature_list(X, features)
-        if features
-        else correlation_table["Feature"].head(top_n).tolist()
-    )
+    selected = ( _resolve_feature_list(X, features) if features else correlation_table["Feature"].head(top_n).tolist() )
     y_values = np.asarray(y, dtype=float)
     paths = []
 
@@ -2976,11 +2306,7 @@ def plot_feature_target_scatter(
         if len(np.unique(x_plot)) > 1:
             slope, intercept = np.polyfit(x_plot, y_plot, 1)
             x_line = np.linspace(x_plot.min(), x_plot.max(), 100)
-            plt.plot(
-                x_line, slope * x_line + intercept,
-                color=settings["reference_line_color"],
-                linewidth=settings["line_width"],
-            )
+            plt.plot( x_line, slope * x_line + intercept, color=settings["reference_line_color"], linewidth=settings["line_width"], )
 
         plt.text(
             0.05, 0.95,
@@ -2995,10 +2321,7 @@ def plot_feature_target_scatter(
         _style_axes(settings)
         plt.tight_layout()
 
-        path = Path(results_dir) / (
-            f"feature_vs_target_{_safe_filename(feature)}_"
-            f"{output_prefix}.{settings['file_format']}"
-        )
+        path = Path(results_dir) / ( f"feature_vs_target_{_safe_filename(feature)}_" f"{output_prefix}.{settings['file_format']}" )
         _finish_figure(path, save_figures, show_figures, settings)
         paths.append(path)
 
@@ -3007,11 +2330,7 @@ def plot_feature_target_scatter(
 def _safe_filename(value: Any) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value))[:120]
 
-def make_feature_pairs(
-    features: list[str],
-    max_pairs: int | None = None,
-    adjacent_only: bool = False,
-) -> list[tuple[str,str]]:
+def make_feature_pairs( features: list[str], max_pairs: int | None = None, adjacent_only: bool = False, ) -> list[tuple[str,str]]:
     if adjacent_only:
         pairs=list(zip(features[:-1],features[1:]))
     else:

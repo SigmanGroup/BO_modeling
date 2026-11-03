@@ -348,6 +348,7 @@ def build_final_model_from_params(model_name: str, params: dict[str, Any], rando
 
 def build_feature_selector_from_trial(trial: optuna.Trial, max_features_cap: int, min_features: int = 1, random_state: int = 42, rfe_step: int | float = 1, n_jobs: int = 1):
     min_features = max(1, min(int(min_features), int(max_features_cap)))
+    rfe_step = int(rfe_step) if rfe_step >= 1 else float(rfe_step)
     selector_name = trial.suggest_categorical( "feature_selector", ["selectkbest", "lasso_feature", "rf_feature", "rfe_feature"], )
 
     if selector_name == "selectkbest":

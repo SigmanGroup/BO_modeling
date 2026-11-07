@@ -2,7 +2,7 @@
 
 Created by: Pauline Bianchi (May 1, 2026)  
 Edited by: Samantha Sloane and Pauline Bianchi  
-Last update: November 2, 2026  
+Last update: November 6, 2026  
 Sigman Lab, University of Utah, Version 1.1
 
 This repository contains two parallel data science workflows for chemical datasets:
@@ -51,7 +51,7 @@ The notebooks provide an interactive interface for configuration, training, plot
 - `bo_regression.py`
 - `bo_classification.py`
 
-The scripts call the same workflow functions as the notebooks, but are designed for non-interactive execution on a high-performance computing cluster.
+The scripts call the same workflow functions as the notebooks and are designed for non-interactive execution on local workstations or high-performance computing clusters.
 
 ### SLURM examples
 
@@ -75,7 +75,26 @@ The environment uses a Python 3.11 / NumPy 1.26-compatible stack for scikit-lear
 
 ---
 
-## 3. Core methodology
+## 3. Quick start
+
+Create and activate the environment:
+
+```bash
+conda env create -f bo_env.yml
+conda activate bo_env
+```
+
+Then either:
+
+- open `bo_regression.ipynb` or `bo_classification.ipynb` for interactive use; or
+- run `bo_regression.py` or `bo_classification.py` from the command line.
+
+For a first test, use the supplied example dataset with a small number of folds and Optuna trials. Results are written to the directory specified by `results_dir` in the notebooks or `--results-dir` from the command line.
+
+---
+
+## 4. Core methodology
+
 
 Both workflows follow the same general architecture:
 
@@ -125,7 +144,7 @@ The same criterion is therefore used consistently for Optuna optimization and fi
 
 ---
 
-## 4. Workflows
+## 5. Workflows
 
 ### 4.1. Regression
 
@@ -205,9 +224,9 @@ Each final full-training ensemble member retains the threshold configuration sel
 
 ---
 
-## 5. Use
+## 6. Use
 
-### 5.1. Notebooks
+### 6.1. Notebooks
 
 Open one of the following:
 
@@ -229,14 +248,14 @@ Typical parameters include:
 - Scoring metric for the optimization;
 - feature-selection bounds;
 - correlation threshold;
-- RFE step size (`rfe_step`);
+- RFE step size (`rfe_step`): values between 0 and 1 remove a fraction of the remaining features per step, while values of 1 or greater are treated as an integer number of features;
 - parallel outer folds (`n_jobs`);
 - optional one-standard-error selection (`one_se`);
 - numerical precision (`round_digits`);
 - output directory;
 - plotting and SHAP options.
 
-### 5.2. Command-line execution
+### 6.2. Command-line execution
 
 The runner and function module must be in the same directory:
 
@@ -347,7 +366,7 @@ python bo_classification.py \
 
 Confusion matrices and threshold-distribution plots are optional in the classification runner and can be enabled with `--plot-confusion-matrix` and `--plot-thresholds`, respectively.
 
-### 5.3. SLURM execution
+### 6.3. SLURM execution
 
 Adapt the paths and cluster directives in the provided templates, then submit with:
 
@@ -360,7 +379,7 @@ The SLURM files do not need to list every parser option. Options that are omitte
 
 ---
 
-## 6. Outputs
+## 7. Outputs
 
 Depending on the enabled options, each run can generate Excel workbooks containing:
 
@@ -396,9 +415,9 @@ Figures may include:
 
 ---
 
-## 7. Specifications
+## 8. Specifications
 
-### 7.1. Reproducibility
+### 8.1. Reproducibility
 
 Random seeds are controlled through:
 
@@ -417,9 +436,9 @@ Exact results may still depend on:
 
 #### Small datasets
 
-Small datasets are particularly sensitive to small numerical differences and to the exact cross-validation split. For datasets with fewer than approximately 20 observations, it is recommended to use at least 5 outer repeats to assess the stability of the reported performance and predictions. Repeated inner cross-validation is also important for model and feature-selection stability: at least 2 inner repeats are recommended when the dataset size permits it. Increasing the number of Optuna trials is not a substitute for repeated validation: on very small datasets, a larger hyperparameter search can increase the risk of overfitting the inner cross-validation splits.
+Small datasets are particularly sensitive to small numerical differences and to the exact cross-validation split. For datasets with fewer than approximately 20 observations, it is recommended to use at least 5 outer repeats to assess the stability of the reported performance and predictions. Repeated inner cross-validation is also important for model and feature-selection stability: at least 2 inner repeats are recommended when the dataset size permits it. Increasing the number of Optuna trials is not a substitute for repeated outer validation: on very small datasets, a larger hyperparameter search can increase the risk of overfitting the inner cross-validation splits.
 
-### 7.2. Data requirements
+### 8.2. Data requirements
 
 The input workbook must contain:
 
@@ -434,6 +453,16 @@ For external and screening datasets, all training descriptor columns must be pre
 
 ---
 
-## 8. License
+## 9. License
 
 The code in this repository is licensed under the MIT License. You are free to use, modify, and distribute the code under the terms of this license.
+
+Copyright (c) 2026 Sigman Lab, University of Utah
+
+---
+
+## 10. Citation and contact
+
+If you use or adapt these workflows, please cite the repository and the associated publication when available.
+
+For questions, bug reports, or reproducibility issues, please use the repository issue tracker.
